@@ -505,7 +505,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 			input_ids = t.cat( [ input_ids, toks ], dim = -1 ) if kv_cache is None else toks
 			padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 ) if kv_cache is None else unpad
-			cache_pos = cache_pos[ ..., :-1 ] + 1
+			cache_pos = cache_pos[ ..., -1: ] + 1
 
 		# Catenate the end token
 		end_toks = t.full( (b, 1), self.end_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
