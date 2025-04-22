@@ -483,7 +483,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		start_toks = t.full(
 			(b, 1), self.start_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
 		input_ids = t.cat( [ input_ids, start_toks ], dim = -1 ) if kv_cache is None else start_toks
-		unpad = t.full( (b, 1), self.pad_token_id, device = input_ids.device, dtype = input_ids.dtype )
+		unpad = t.full( (b, 1), True, device = input_ids.device, dtype = input_ids.dtype )
 		padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 ) if kv_cache is None else unpad
 
 		if cache_pos is not None:
