@@ -157,16 +157,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 	_supports_static_cache = True
 	base_model_prefix = "lm_model"
 
-	# def _init_weights( self, module ):
-	# 	std = self.config.initializer_range
-	# 	if isinstance( module, t.nn.Linear ):
-	# 		module.weight.data.normal_( mean = 0.0, std = std )
-	# 		if module.bias is not None:
-	# 			module.bias.data.zero_()
-	# 	elif isinstance( module, t.nn.Embedding ):
-	# 		module.weight.data.normal_( mean = 0.0, std = std )
-	# 		if module.padding_idx is not None:
-	# 			module.weight.data[ module.padding_idx ].zero_()
+	def _init_weights( self, module ):
+		std = self.config.initializer_range
+		if isinstance( module, t.nn.Linear ):
+			module.weight.data.normal_( mean = 0.0, std = std )
+			if module.bias is not None:
+				module.bias.data.zero_()
 
 	def __init__( self, config: ThoughtModelConfig, *, lm_model = None ):
 		super().__init__( config )
@@ -485,7 +481,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		# Catenate the start token
 		start_toks = t.full(
-			(b, 1), self.start_thought_token_id_id, device = input_ids.device, dtype = input_ids.dtype )
+			(b, 1), self.start_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
 		input_ids = t.cat( [ input_ids, start_toks ], dim = -1 ) if kv_cache is None else start_toks
 
 		if cache_pos is not None:
@@ -506,7 +502,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			input_ids = t.cat( [ input_ids, toks ], dim = -1 ) if kv_cache is None else toks
 
 		# Catenate the end token
-		end_toks = t.full( (b, 1), self.end_thought_token_id_id, device = input_ids.device, dtype = input_ids.dtype )
+		end_toks = t.full( (b, 1), self.end_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
 		input_ids = t.cat( [ input_ids, end_toks ], dim = -1 )
 
 		post_logits, post_hidden = self.naive_forward(
