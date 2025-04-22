@@ -488,7 +488,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			cache_pos = cache_pos[ ..., :-1 ] + 1
 		elif kv_cache is not None:
 			seen_tokens = kv_cache.get_seq_length()
-			cache_pos = t.arange( seen_tokens, seen_tokens + input_ids.shape[ -1 ] )
+			cache_pos = t.arange( seen_tokens, seen_tokens + input_ids.shape[ -1 ], device = input_ids.device )
 
 		# Generate the thought
 		for _ in range( thought_depth ):
