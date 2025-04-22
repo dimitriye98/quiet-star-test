@@ -37,6 +37,7 @@ save_steps = 100
 default_params = {
 	# "base_model": "mistralai/Mistral-7B-v0.1",
 	"base_model": "Qwen/Qwen2.5-0.5B",
+	"torch_dtype": torch.bfloat16 if torch.cuda.is_available() or torch.backends.mps.is_available() else torch.float32,
 	"base_model_kwargs": {
 		"torch_dtype": torch.bfloat16 if torch.cuda.is_available() or torch.backends.mps.is_available() else torch.float32,
 		"device_map": "auto",
