@@ -157,12 +157,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 	_supports_static_cache = True
 	base_model_prefix = "lm_model"
 
-	def _init_weights( self, module ):
-		std = self.config.initializer_range
-		if isinstance( module, t.nn.Linear ):
-			module.weight.data.normal_( mean = 0.0, std = std )
-			if module.bias is not None:
-				module.bias.data.zero_()
+	# def _init_weights( self, module ):
+	# 	std = self.config.initializer_range
+	# 	if isinstance( module, t.nn.Linear ):
+	# 		module.weight.data.normal_( mean = 0.0, std = std )
+	# 		if module.bias is not None:
+	# 			module.bias.data.zero_()
 
 	def __init__( self, config: ThoughtModelConfig, *, lm_model = None ):
 		super().__init__( config )
