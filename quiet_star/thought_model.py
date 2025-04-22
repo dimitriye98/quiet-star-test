@@ -89,6 +89,11 @@ class MixerConfig:
 	def __iter__( self ):
 		yield from self.to_dict().items()
 
+def nanmin( x ):
+	return x[ ~x.isnan() ].min()
+
+def nanmax( x ):
+	return x[ ~x.isnan() ].max()
 
 class ThoughtModelConfig( PretrainedConfig ):
 	model_type = "thought_model"
@@ -203,7 +208,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		combined_mask = countercausal_mask & padding_mask
 
 		# Invert the mask and return
-		return t.zeros_like( combined_mask, dtype = dtype, device = device ).masked_fill( combined_mask, t.finfo( dtype ).min )
+		return t.zeros_like( combined_mask, dtype = dtype, device = device ).masked_fill(
+			~combined_mask, t.finfo( dtype ).min )
 
 	@staticmethod
 	def sample_thoughts( logits, thought_temperature ):
@@ -212,11 +218,11 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		return t.argmax( logits, dim = -1 )
 
-	def prepare_cache_positions( self, d_bot, d_top, l, device=None ):
+	def prepare_cache_positions( self, d_bot, d_top, l, device = None ):
 		if device is None:
 			device = self.device
-		layers = t.arange( d_bot, d_top, device=device )
-		return t.arange( l, device=device ) + l * layers.unsqueeze( -1 )
+		layers = t.arange( d_bot, d_top, device = device )
+		return t.arange( l, device = device ) + l * layers.unsqueeze( -1 )
 
 	def broadcast_logits( self, ts, kv_cache, layers_cached, layer_to_gen, mask, keep = 1 ):
 		b, n, d, l = ts.shape
@@ -231,7 +237,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		a_mask = x.rearrange( "b n D L d l -> (b n) 1 (D L) (d l)", mask )
 		input_ids = x.rearrange( "b n d l -> (b n) (d l)", ts )
-		position_ids = x.rearrange( "d l -> (b n) (d l)", t.arange( l, device = ts.device ) + t.arange( d, device = ts.device ).unsqueeze( -1 ), b = b, n = n )
+		position_ids = x.rearrange(
+			"d l -> (b n) (d l)", t.arange( l, device = ts.device ) + t.arange( d, device = ts.device ).unsqueeze( -1 ),
+			b = b, n = n )
 
 		out = self.lm_model(
 			input_ids = input_ids,
@@ -279,7 +287,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		# Duplicate the batch for each thought
 		ts = x.rearrange( "b l -> b n 1 l", truncated_input, n = self.n_thoughts )
-		padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = self.n_thoughts )
+		# padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = self.n_thoughts )
 
 		# Add <thought>
 		start_toks = t.full(
@@ -293,7 +301,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			n = ts.shape[ 1 ],
 			d = 3 + self.look_ahead + self.thought_depth,  # input (1), start tok (1), depth, end tok (1), look ahead
 			l = ts.shape[ 3 ],
-			padding_mask = padding_mask[ ..., :-self.look_ahead ],
+			padding_mask = x.rearrange("b l -> b n l", padding_mask, n = self.n_thoughts)[ ..., :-self.look_ahead ],
 			dtype = self.dtype )
 
 		# Generate thoughts
@@ -341,9 +349,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			layer_to_gen += 1
 			post_logits, post_hidden_states = None, None
 			for i in range( 0, self.look_ahead ):
-				slice_mask = thought_mask[ :, :, layers_cached : layer_to_gen, :, :, : ]
+				slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
 				log, hidden = self.broadcast_logits(
-					ts[ :, :, layers_cached : layer_to_gen, : ],
+					ts[ :, :, layers_cached: layer_to_gen, : ],
 					kv_cache,
 					layers_cached,
 					layer_to_gen,
@@ -360,9 +368,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				layer_to_gen += 1
 		else:
 			layer_to_gen += self.look_ahead
-			slice_mask = thought_mask[ :, :, layers_cached : layer_to_gen, :, :, : ]
+			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
 			post_logits, post_hidden_states = self.broadcast_logits(
-				ts[ :, :, layers_cached : layer_to_gen, : ],
+				ts[ :, :, layers_cached: layer_to_gen, : ],
 				kv_cache,
 				layers_cached,
 				layer_to_gen,
@@ -374,7 +382,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		# Logits without thought
 		prior_logits, prior_hidden_states = self.naive_forward(
-			input_ids[ :, :-1 ], padding_mask, keep = self.look_ahead )
+			input_ids[ :, :-1 ], padding_mask[ :, :-1 ], keep = self.look_ahead )
 		prior_logits = prior_logits.unfold( -2, self.look_ahead, 1 )
 		# prior_logits = t.movedim( prior_logits, -1, -3 )  # b l v d -> b d l v
 		prior_logits = x.rearrange( "b l v d -> b n d l v", prior_logits, n = self.n_thoughts )
@@ -382,7 +390,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# prior_hidden_states = t.movedim( prior_hidden_states, -1, -3 )  # b l e d -> b d l e
 		prior_hidden_states = x.rearrange( "b l e d -> b n d l e", prior_hidden_states, n = self.n_thoughts )
 
-		alpha = self.mixer_head( prior_hidden_states, post_hidden_states )
+		alpha = self.mixer_head( prior_hidden_states.expand_as( post_hidden_states ), post_hidden_states )
 		logits = alpha * post_logits + (1 - alpha) * prior_logits
 
 		# Compute cross entropy loss
@@ -391,9 +399,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			logits.reshape( -1, v ), targets.reshape( -1 ),
 			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
 			reduction = "none" ).reshape_as( targets )
-		cross_entropy_loss = cross_entropy_loss.masked_fill( padding_mask[ ..., :-self.look_ahead ], t.nan )
+		cross_entropy_loss = cross_entropy_loss.masked_fill( x.rearrange("b l -> b 1 1 l", (~padding_mask.bool()))[ ..., :-self.look_ahead ], t.nan )
 		# Pool loss per thought
-		cross_entropy_loss = x.reduce( "b n [d] l", cross_entropy_loss, op = "nanmean" )
+		cross_entropy_loss = x.reduce( "b n [d] l", cross_entropy_loss, op = t.nanmean )
 
 		# Compute REINFORCE loss
 		r = -cross_entropy_loss
@@ -401,15 +409,15 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		reward = t.nn.functional.relu( r - r_mean ).detach()
 
 		# Apply REINFORCE loss
-		thought_targets = ts[ ..., 2:2 + self.thought_depth ]
+		thought_targets = ts[ ..., 2:2 + self.thought_depth, : ]
 		v = thought_logits.shape[ -1 ]
 		thought_loss = t.nn.functional.cross_entropy(
 			thought_logits.reshape( -1, v ), thought_targets.reshape( -1 ),
 			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
 			reduction = "none" ).reshape_as( thought_targets )
-		thought_loss = thought_loss.masked_fill( padding_mask[ ..., :-self.look_ahead ], t.nan )
+		thought_loss = thought_loss.masked_fill( (~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
 		# Pool loss per thought
-		thought_loss = x.reduce( "b n [d] l", thought_loss, op = "nanmean" ) * reward
+		thought_loss = x.reduce( "b n [d] l", thought_loss, op = t.nanmean ) * reward
 
 		# # Compute confidence loss
 		# conf_alpha = alpha[ ..., 1:, :-(self.look_ahead - 1), : ]
@@ -431,25 +439,26 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		loss = self.beta_cross_entropy * cross_entropy_loss + self.beta_thought * thought_loss
 		loss = t.nanmean( loss )
 
-		if self.logger is not None:
-			self.logger.log(
-				{
-					"cross_entropy_avg": t.nanmean( cross_entropy_loss ).item(),
-					"cross_entropy_min": t.nanmin( cross_entropy_loss ).item(),
-					"cross_entropy_max": t.nanmax( cross_entropy_loss ).item(),
-					"thought_loss_avg": t.nanmean( thought_loss ).item(),
-					"thought_loss_min": t.nanmin( thought_loss ).item(),
-					"thought_loss_max": t.nanmax( thought_loss ).item(),
-					"alpha_avg": t.nanmean( x.reduce( "b n [d] l a", alpha, op = "nanmean" ) ).item(),
-					"alpha_min": t.nanmin( x.reduce( "b n [d] l a", alpha, op = "nanmean" ) ).item(),
-					"alpha_max": t.nanmax( x.reduce( "b n [d] l a", alpha, op = "nanmean" ) ).item(),
-					"reward_avg": t.nanmean( reward ).item(),
-					"reward_min": t.nanmin( reward ).item(),
-					"reward_max": t.nanmax( reward ).item(),
-					"loss": loss.item()
-				} )
+		stats = {
+			"cross_entropy_avg": t.nanmean( cross_entropy_loss ).item(),
+			"cross_entropy_min": nanmin( cross_entropy_loss ).item(),
+			"cross_entropy_max": nanmax( cross_entropy_loss ).item(),
+			"thought_loss_avg": t.nanmean( thought_loss ).item(),
+			"thought_loss_min": nanmin( thought_loss ).item(),
+			"thought_loss_max": nanmax( thought_loss ).item(),
+			"alpha_avg": t.nanmean( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+			"alpha_min": nanmin( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+			"alpha_max": nanmax( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+			"r_avg": t.nanmean( r ).item(),
+			"r_min": nanmin( r ).item(),
+			"r_max": nanmax( r ).item(),
+			"reward_avg": t.nanmean( reward ).item(),
+			"reward_min": nanmin( reward ).item(),
+			"reward_max": nanmax( reward ).item(),
+			"loss": loss.item()
+		}
 
-		return logits, loss
+		return loss, logits, stats
 
 	@classmethod
 	def truncate_cache( cls, kv_cache, l ):
@@ -527,9 +536,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		if thought_temperature is None:
 			thought_temperature = self.thought_temperature
 		if self.training:
-			logits, loss = self.training_forward(
-				input_ids, labels, attention_mask, thought_temperature, kv_cache = past_key_values )
-			return CausalLMOutput( logits = logits, loss = cast( t.FloatTensor, loss ) )
+			return self.training_forward( input_ids, labels, attention_mask, thought_temperature, kv_cache = past_key_values )
 		else:
 			logits = self.inference_forward(
 				input_ids, attention_mask, thought_temperature, kv_cache = past_key_values,

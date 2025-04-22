@@ -1,3 +1,4 @@
+import contextlib
 import copy
 
 import torch
@@ -159,16 +160,23 @@ training_args = TrainingArguments(
 	#use_mps_device = True,
 )
 
+@contextlib.contextmanager
+def cm_memory():
+	torch.cuda.memory._record_memory_history(max_entries=100000, stacks="python")
+	try:
+		yield
+	finally:
+		torch.cuda.memory._dump_snapshot("snapshot.pickle")
+	torch.cuda.memory._record_memory_history(enabled=None)
+
 class TrainerWithCache(Trainer):
 	def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
 		inputs["past_key_values"] = DynamicCache()
-		torch.cuda.memory._record_memory_history(max_entries=100000, stacks="python")
 
-		try:
-			super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
-		finally:
-			torch.cuda.memory._dump_snapshot("snapshot.pickle")
-		torch.cuda.memory._record_memory_history(enabled=None)
+		with cm_memory() if torch.cuda.is_available() else contextlib.nullcontext():
+			loss, o = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+		self.log(o[2])
+		return (loss, o) if return_outputs else loss
 
 
 trainer = TrainerWithCache(
