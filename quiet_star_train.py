@@ -54,7 +54,8 @@ default_params = {
 		trainable_token_indices = [], # Empty list is signal value for ["<thought>", "</thought>"]
 		# modules_to_save = [m for m, _ in test_model.named_modules() if "mixer_head.mlp." in m],
 		modules_to_save = ["mixer_head"],
-	)
+	),
+	"look_ahead_pass": 1,
 }
 
 def model_init(p):

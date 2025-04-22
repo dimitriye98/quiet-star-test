@@ -102,6 +102,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			beta_thought: float = 1e6,
 			end_thought_token_id: int = None,
 			look_ahead: int = 4,
+			look_ahead_pass: int = None,
 			n_thoughts: int = 2,
 			pad_token_id: int = None,
 			start_thought_token_id: int = None,
@@ -116,6 +117,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.beta_thought = beta_thought
 		self.end_thought_token_id = end_thought_token_id
 		self.look_ahead = look_ahead
+		self.look_ahead_pass = look_ahead_pass
 		self.n_thoughts = n_thoughts
 		self.pad_token_id = pad_token_id
 		self.start_thought_token_id = start_thought_token_id
@@ -170,6 +172,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.beta_cross_entropy = config.beta_cross_entropy
 		self.beta_thought = config.beta_thought
 		self.look_ahead = config.look_ahead
+		self.look_ahead_pass = config.look_ahead_pass
 		self.mixer_config = config.mixer_config
 		self.n_thoughts = config.n_thoughts
 		self.thought_depth = config.thought_depth
@@ -330,20 +333,44 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		# Append the targets to the thoughts
 		ts = t.cat( (ts, targets), dim = -2 )
-		layer_to_gen += self.look_ahead
 
 		# Logits with thought
-		slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
-		post_logits, post_hidden_states = self.broadcast_logits(
-			ts[ :, :, layers_cached: layer_to_gen, : ],
-			kv_cache,
-			layers_cached,
-			layer_to_gen,
-			slice_mask,
-			keep = self.look_ahead )
-		# We won't use this anymore, but update it as a matter of hygiene
-		layers_cached = layer_to_gen
-		layer_to_gen += 1
+		if self.look_ahead_pass is not None:
+			if self.look_ahead_pass != 1:
+				raise NotImplementedError
+			layer_to_gen += 1
+			post_logits, post_hidden_states = None, None
+			for i in range( 0, self.look_ahead ):
+				slice_mask = thought_mask[ :, :, layers_cached : layer_to_gen, :, :, : ]
+				log, hidden = self.broadcast_logits(
+					ts[ :, :, layers_cached : layer_to_gen, : ],
+					kv_cache,
+					layers_cached,
+					layer_to_gen,
+					slice_mask,
+					keep = 1 )
+				if i == 0:
+					post_logits = log
+					post_hidden_states = hidden
+				else:
+					post_logits = t.cat( (post_logits, log), dim = -3 )
+					post_hidden_states = t.cat( (post_hidden_states, hidden), dim = -3 )
+
+				layers_cached = layer_to_gen
+				layer_to_gen += 1
+		else:
+			layer_to_gen += self.look_ahead
+			slice_mask = thought_mask[ :, :, layers_cached : layer_to_gen, :, :, : ]
+			post_logits, post_hidden_states = self.broadcast_logits(
+				ts[ :, :, layers_cached : layer_to_gen, : ],
+				kv_cache,
+				layers_cached,
+				layer_to_gen,
+				slice_mask,
+				keep = self.look_ahead )
+			# We won't use this anymore, but update it as a matter of hygiene
+			layers_cached = layer_to_gen
+			layer_to_gen += 1
 
 		# Logits without thought
 		prior_logits, prior_hidden_states = self.naive_forward(
