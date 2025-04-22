@@ -100,7 +100,7 @@ def nanmax( x ):
 class ThoughtModelConfig( PretrainedConfig ):
 	model_type = "thought_model"
 	is_composition = True
-	sub_configs = { "mixer_config": MixerConfig, "lm_config": AutoConfig }
+	sub_configs = { "mixer_config": MixerConfig, "text_config": AutoConfig }
 
 	def __init__(
 			self,
@@ -117,7 +117,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			thought_temperature: float = 0.0,
 
 			mixer_config: dict | MixerConfig = None,
-			lm_config: dict | PretrainedConfig = None,
+			text_config: dict | PretrainedConfig = None,
 			**kwargs ):
 
 		self.beta_cross_entropy = beta_cross_entropy
@@ -131,18 +131,20 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.thought_depth = thought_depth
 		self.thought_temperature = thought_temperature
 
-		if isinstance( lm_config, dict ):
-			lm_config[ "hidden_size" ] = kwargs.get( "hidden_size", None )
-			if "model_type" not in lm_config:
+		if text_config is None:
+			raise ValueError( "`text_config` must be specified" )
+		elif isinstance( text_config, dict ):
+			text_config[ "hidden_size" ] = kwargs.get( "hidden_size", None )
+			if "model_type" not in text_config:
 				raise ValueError( f"`lm_config` must have `model_type`" )
-			self.lm_config = AutoConfig.for_model( lm_config[ "model_type" ], **lm_config )
+			self.text_config = AutoConfig.for_model( text_config[ "model_type" ], **text_config )
 		else:
-			self.lm_config = lm_config
+			self.text_config = text_config
 
 		if mixer_config is None:
-			self.mixer_config = MixerConfig( _inject_hidden_size = self.lm_config.hidden_size )
+			self.mixer_config = MixerConfig( _inject_hidden_size = self.text_config.hidden_size )
 		elif isinstance( mixer_config, dict ):
-			self.mixer_config = MixerConfig( **mixer_config, _inject_hidden_size = self.lm_config.hidden_size )
+			self.mixer_config = MixerConfig( **mixer_config, _inject_hidden_size = self.text_config.hidden_size )
 		else:
 			self.mixer_config = mixer_config
 
@@ -181,7 +183,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.thought_depth = config.thought_depth
 		self.thought_temperature = config.thought_temperature
 
-		self.lm_model = lm_model if lm_model is not None else AutoModel.from_config( config.lm_config )
+		self.lm_model = lm_model if lm_model is not None else AutoModel.from_config( config.text_config )
 		self.mixer_head = WeightedMixerHead( config, lm_model.config.hidden_size )
 
 		self.post_init()
@@ -532,6 +534,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			inputs_embeds = None,
 			labels = None,
 			use_cache = None,
+			cache_position = None,
 			output_attentions = None,
 			output_hidden_states = None,
 			return_dict = None,
@@ -545,7 +548,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				input_ids, labels, attention_mask, thought_temperature, kv_cache = past_key_values )
 		else:
 			logits = self.inference_forward(
-				input_ids, attention_mask, thought_temperature, kv_cache = past_key_values,
+				input_ids, attention_mask, thought_temperature, kv_cache = past_key_values, cache_pos = cache_position,
 				thought_depth = thought_depth )
 			return CausalLMOutput( logits = logits )
 
