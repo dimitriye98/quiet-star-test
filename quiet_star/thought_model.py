@@ -100,6 +100,13 @@ class ThoughtModelConfig( PretrainedConfig ):
 	is_composition = True
 	sub_configs = { "mixer_config": MixerConfig, "lm_config": AutoConfig }
 
+	def _init_weights(self, module):
+		std = self.config.initializer_range
+		if isinstance(module, t.nn.Linear):
+			module.weight.data.normal_(mean=0.0, std=std)
+			if module.bias is not None:
+				module.bias.data.zero_()
+
 	def __init__(
 			self,
 			*,
