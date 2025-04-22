@@ -1,5 +1,3 @@
-from typing import cast
-
 import einx as x
 import torch as t
 from transformers import GenerationMixin, PreTrainedModel, DynamicCache, PretrainedConfig, AutoConfig, AutoModel
@@ -90,11 +88,14 @@ class MixerConfig:
 	def __iter__( self ):
 		yield from self.to_dict().items()
 
+
 def nanmin( x ):
 	return x[ ~x.isnan() ].min()
 
+
 def nanmax( x ):
 	return x[ ~x.isnan() ].max()
+
 
 class ThoughtModelConfig( PretrainedConfig ):
 	model_type = "thought_model"
@@ -298,7 +299,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			n = ts.shape[ 1 ],
 			d = 3 + self.look_ahead + self.thought_depth,  # input (1), start tok (1), depth, end tok (1), look ahead
 			l = ts.shape[ 3 ],
-			padding_mask = x.rearrange("b l -> b n l", padding_mask, n = self.n_thoughts)[ ..., :-self.look_ahead ],
+			padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = self.n_thoughts )[ ..., :-self.look_ahead ],
 			dtype = self.dtype )
 
 		# Generate thoughts
@@ -396,7 +397,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			logits.reshape( -1, v ), targets.reshape( -1 ),
 			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
 			reduction = "none" ).reshape_as( targets )
-		cross_entropy_loss = cross_entropy_loss.masked_fill( x.rearrange("b l -> b 1 1 l", (~padding_mask.bool()))[ ..., :-self.look_ahead ], t.nan )
+		cross_entropy_loss = cross_entropy_loss.masked_fill(
+			x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
 		# Pool loss per thought
 		cross_entropy_loss = x.reduce( "b n [d] l", cross_entropy_loss, op = t.nanmean )
 
@@ -503,11 +505,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 			input_ids = t.cat( [ input_ids, toks ], dim = -1 ) if kv_cache is None else toks
 			padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 ) if kv_cache is None else unpad
+			cache_pos = cache_pos[ ..., :-1 ] + 1
 
 		# Catenate the end token
 		end_toks = t.full( (b, 1), self.end_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
 		input_ids = t.cat( [ input_ids, end_toks ], dim = -1 )
-		padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 )
+		padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 ) if kv_cache is None else unpad.expand( (b, 2) )
 
 		post_logits, post_hidden = self.naive_forward(
 			input_ids, padding_mask, kv_cache = kv_cache, cache_pos = cache_pos
@@ -537,7 +540,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		if thought_temperature is None:
 			thought_temperature = self.thought_temperature
 		if self.training:
-			return self.training_forward( input_ids, labels, attention_mask, thought_temperature, kv_cache = past_key_values )
+			return self.training_forward(
+				input_ids, labels, attention_mask, thought_temperature, kv_cache = past_key_values )
 		else:
 			logits = self.inference_forward(
 				input_ids, attention_mask, thought_temperature, kv_cache = past_key_values,
