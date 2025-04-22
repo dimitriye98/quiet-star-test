@@ -10,6 +10,7 @@ from transformers.modeling_outputs import CausalLMOutput
 class WeightedMixerHead( t.nn.Module ):
 	def __init__( self, config, lm_hidden_size ):
 		super().__init__()
+		self.config = config
 		hs, ms, nl = lm_hidden_size, config.mixer_config.hidden_size, config.mixer_config.hidden_layers
 		layers = [ t.nn.Linear( 2 * hs, ms ) ]
 		for _ in range( nl ):
@@ -99,13 +100,6 @@ class ThoughtModelConfig( PretrainedConfig ):
 	model_type = "thought_model"
 	is_composition = True
 	sub_configs = { "mixer_config": MixerConfig, "lm_config": AutoConfig }
-
-	def _init_weights(self, module):
-		std = self.config.initializer_range
-		if isinstance(module, t.nn.Linear):
-			module.weight.data.normal_(mean=0.0, std=std)
-			if module.bias is not None:
-				module.bias.data.zero_()
 
 	def __init__(
 			self,
