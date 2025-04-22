@@ -1,5 +1,4 @@
 import copy
-from typing import override
 
 import torch
 from peft import PeftConfig, get_peft_model, LoraConfig
@@ -27,7 +26,7 @@ project_name = "quiet-star"
 os.environ["WANDB_PROJECT"] = project_name + "-" + dataset_name.split("/")[-1]
 os.environ["WANDB_CACHE_DIR"] = wandb_cache_dir
 n_ahead_talk_global = 4
-n_passes_global = 2
+n_passes_global = 8
 n_ahead_global = 12
 n_examples = 1_000
 full_batch_size = 8
@@ -40,7 +39,7 @@ default_params = {
 	"base_model_kwargs": {
 		"torch_dtype": torch.bfloat16 if torch.cuda.is_available() or torch.backends.mps.is_available() else torch.float32,
 		"device_map": "auto",
-		"cache_dir": root_prefix + "cache",
+		#"cache_dir": root_prefix + "cache",
 	},
 	"tokenizer_kwargs": {
 		"padding_side": "right",
@@ -120,7 +119,7 @@ dataset = load_dataset(
 	split=f"train[:{n_examples}]",
 	# ignore_verifications=True,
 	num_proc=1,
-	cache_dir=root_prefix + "cache/datasets/",
+	#cache_dir=root_prefix + "cache/datasets/",
 )
 
 train_dataset = dataset.shuffle(seed=random_seed).map(preprocess_function, batched=True, writer_batch_size=200)
@@ -156,27 +155,27 @@ training_args = TrainingArguments(
 	eval_strategy="steps",
 	save_steps=save_steps,
 	run_name=f"n={n_ahead_global}_nt={n_ahead_talk_global}_np={n_passes_global}",
-	use_mps_device = True,
+	#use_mps_device = True,
 )
 
 class TrainerWithCache(Trainer):
-	@override
 	def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
 		inputs["past_key_values"] = DynamicCache()
+		torch.cuda.memory._record_memory_history(max_entries=100000, stacks="python")
 
-		super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+		try:
+			super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+		finally:
+			torch.cuda.memory._dump_snapshot("snapshot.pickle")
+		torch.cuda.memory._record_memory_history(enabled=None)
 
-torch.cuda.memory._record_memory_history(max_entries=100000)
 
-try:
-	trainer = TrainerWithCache(
-		args=training_args,
-		train_dataset=train_dataset,
-		eval_dataset=eval_datasets,
-		compute_metrics=compute_metrics,
-		model_init=model_init,
-	)
-finally:
-	torch.cuda.memory._dump_snapshot("snapshot.pickle")
+trainer = TrainerWithCache(
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_datasets,
+    compute_metrics=compute_metrics,
+    model_init=model_init,
+)
 
 trainer.train()
