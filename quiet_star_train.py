@@ -8,7 +8,7 @@ from quiet_star import ThoughtModelConfig, ThoughtModel
 
 torch.backends.cuda.matmul.allow_tf32 = True
 import random
-from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel, DynamicCache
 from datasets import load_dataset
 from transformers import TrainingArguments, Trainer
 import os
@@ -99,7 +99,7 @@ def model_init(p):
 	params["lm_config"] = lm_model.config
 
 	model_config = ThoughtModelConfig(**params)
-	model = ThoughtModel(model_config, lm_model = lm_model)
+	model = AutoModel.from_config(model_config, lm_model = lm_model)
 
 	if peft_config is not None:
 		if isinstance(peft_config, dict):
