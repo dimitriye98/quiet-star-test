@@ -483,6 +483,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		start_toks = t.full(
 			(b, 1), self.start_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
 		input_ids = t.cat( [ input_ids, start_toks ], dim = -1 ) if kv_cache is None else start_toks
+		unpad = t.full( (b, 1), self.pad_token_id, device = input_ids.device, dtype = input_ids.dtype )
+		padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 ) if kv_cache is None else unpad
 
 		if cache_pos is not None:
 			cache_pos = cache_pos[ ..., :-1 ] + 1
@@ -500,10 +502,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			toks = self.sample_thoughts( logits, thought_temperature )
 
 			input_ids = t.cat( [ input_ids, toks ], dim = -1 ) if kv_cache is None else toks
+			padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 ) if kv_cache is None else unpad
 
 		# Catenate the end token
 		end_toks = t.full( (b, 1), self.end_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
 		input_ids = t.cat( [ input_ids, end_toks ], dim = -1 )
+		padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 )
 
 		post_logits, post_hidden = self.naive_forward(
 			input_ids, padding_mask, kv_cache = kv_cache, cache_pos = cache_pos
