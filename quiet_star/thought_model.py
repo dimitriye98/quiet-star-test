@@ -261,6 +261,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		return log, hidden
 
 	def naive_forward( self, input_ids, padding_mask, kv_cache = None, cache_pos = None, keep = 1 ):
+		assert input_ids.shape[-1] == cache_pos.shape[-1]
+		assert padding_mask.shape[-1] == input_ids.shape[-1] + kv_cache.get_seq_length()
+
 		out = self.lm_model(
 			input_ids = input_ids,
 			attention_mask = padding_mask,
@@ -477,7 +480,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		b, l = input_ids.shape
 
 		if kv_cache is not None:
-			l = kv_cache.get_seq_length()
+			l += kv_cache.get_seq_length()
 
 		prior_logits, prior_hidden = self.naive_forward(
 			input_ids, padding_mask, kv_cache = kv_cache, cache_pos = cache_pos
@@ -491,7 +494,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 )
 
 		if cache_pos is not None:
-			cache_pos = cache_pos[ ..., :-1 ] + 1
+			cache_pos = cache_pos[ ..., -1: ] + 1
+			assert cache_pos.shape[-1] == 1
 		elif kv_cache is not None:
 			seen_tokens = kv_cache.get_seq_length()
 			cache_pos = t.arange( seen_tokens, seen_tokens + input_ids.shape[ -1 ], device = input_ids.device )
@@ -521,7 +525,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		alpha = self.mixer_head( prior_hidden, post_hidden )
 
-		self.truncate_cache( kv_cache, l + 1 )
+		self.truncate_cache( kv_cache, l )
 
 		return prior_logits * (1 - alpha) + post_logits * alpha
 
