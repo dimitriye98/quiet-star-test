@@ -511,6 +511,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		end_toks = t.full( (b, 1), self.end_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
 		input_ids = t.cat( [ input_ids, end_toks ], dim = -1 )
 		padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 ) if kv_cache is None else unpad.expand( (b, 2) )
+		cache_pos = cache_pos[ ..., -1: ] + 1
 
 		post_logits, post_hidden = self.naive_forward(
 			input_ids, padding_mask, kv_cache = kv_cache, cache_pos = cache_pos
