@@ -276,7 +276,7 @@ class TrainerWithCache(Trainer):
 trainer = TrainerWithCache(
     args=training_args,
     train_dataset=train_dataset,
-    eval_dataset=["commonsense_qa", "gsm8k"],
+    eval_dataset=["commonsense_qa"],# "gsm8k"],
     compute_metrics=compute_metrics,
     model_init=model_init,
 	processing_class=tokenizer,
