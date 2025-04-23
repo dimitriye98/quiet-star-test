@@ -261,7 +261,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		return log, hidden
 
 	def naive_forward( self, input_ids, padding_mask, kv_cache = None, cache_pos = None, keep = 1 ):
-		assert input_ids.shape[ -1 ] == cache_pos.shape[ -1 ]
+		assert cache_pos is None or input_ids.shape[ -1 ] == cache_pos.shape[ -1 ]
 		assert padding_mask.shape[ -1 ] == input_ids.shape[ -1 ] + (
 			kv_cache.get_seq_length() if kv_cache is not None else 0)
 
@@ -533,7 +533,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		if kv_cache is not None:
 			self.truncate_cache( kv_cache, l )
 
-		return prior_logits * (1 - alpha) + post_logits * alpha
+		out = prior_logits * (1 - alpha) + post_logits * alpha
+		assert out.shape == (b, 1, self.config.text_config.vocab_size)
+		return out
 
 	def forward(
 			self,

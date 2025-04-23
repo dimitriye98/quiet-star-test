@@ -148,7 +148,7 @@ global_gradient_accumulation_steps = full_batch_size // batch_size
 run_id = int(time.time())
 training_args = TrainingArguments(
 	output_dir=root_prefix + f"cache/quietstar/{run_id}",
-	# report_to = "wandb",
+	report_to = "wandb",
 	learning_rate=1e-6,
 	optim="adamw_torch_fused" if torch.cuda.is_available() or torch.backends.mps.is_available() else "adamw_torch",
 	per_device_train_batch_size=batch_size,
@@ -179,6 +179,17 @@ def cm_memory():
 		torch.cuda.memory._dump_snapshot("snapshot.pickle")
 	torch.cuda.memory._record_memory_history(enabled=None)
 
+class HFLMThought(HFLM):
+
+	def _select_cont_toks( self, logits: torch.Tensor, contlen: int = None, inplen: int = None ) -> torch.Tensor:
+		# The default implementation of HFLM assumes logits are emitted for
+		# the entire input sequence, and truncates them away.
+		# That's expensive and unnecessary for our model, but not
+		# conforming to it breaks the implementation. However, making this
+		# truncation function a no-op is a sufficient fix.
+		return logits
+
+
 class TrainerWithCache(Trainer):
 
 	def __init__(
@@ -207,11 +218,11 @@ class TrainerWithCache(Trainer):
 			self,
 			eval_dataset = None,
 			ignore_keys = None,
-			metric_key_prefix: str = "eval" ) -> dict[ str, float ]:
+			metric_key_prefix: str = "eval_" ) -> dict[ str, float ]:
 		override = eval_dataset is not None
 		eval_dataset = eval_dataset if override else self.eval_dataset
 
-		hflm = HFLM(self.model, backend = "causal", tokenizer = self.tokenizer)
+		hflm = HFLMThought(self.model, backend = "causal", batch_size = "auto", max_batch_size = 512, tokenizer = self.processing_class)
 
 		results = simple_evaluate(
 			model=hflm,
@@ -219,50 +230,7 @@ class TrainerWithCache(Trainer):
 			task_manager = self.task_manager,
 		)
 
-		return results
-
-
-
-	# def prediction_step(
-	# 		self,
-	# 		model,
-	# 		inputs,
-	# 		prediction_loss_only,
-	# 		ignore_keys,
-	# ):
-	# 	if prediction_loss_only:
-	# 		raise NotImplementedError
-	#
-	# 	has_labels = False if len(self.label_names) == 0 else all(inputs.get(k) is not None for k in self.label_names)
-	#
-	# 	inputs = self._prepare_inputs(inputs)
-	# 	if ignore_keys is None:
-	# 		if hasattr(self.model, "config"):
-	# 			ignore_keys = getattr(self.model.config, "keys_to_ignore_at_inference", ["past_key_values"])
-	# 		else:
-	# 			ignore_keys = []
-	#
-	# 	# labels may be popped when computing the loss (label smoothing for instance) so we grab them first.
-	# 	if has_labels:
-	# 		labels = nested_detach(tuple(inputs.get(name) for name in self.label_names))
-	# 		if len(labels) == 1:
-	# 			labels = labels[0]
-	# 	else:
-	# 		labels = None
-	#
-	# 	with torch.inference_mode():
-	# 		with self.compute_loss_context_manager():
-	# 			outputs = model.generate(**inputs)
-	# 		if isinstance(outputs, dict):
-	# 			logits = tuple(v for k, v in outputs.items() if k not in ignore_keys)
-	# 		else:
-	# 			logits = outputs
-	#
-	# 	logits = nested_detach(logits)
-	# 	if len(logits) == 1:
-	# 		logits = logits[0]
-	#
-	# 	return None, logits, labels
+		return { metric_key_prefix + k: v for k, v in results.items() }
 
 	def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
 		inputs["past_key_values"] = DynamicCache()
