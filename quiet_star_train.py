@@ -168,7 +168,7 @@ training_args = TrainingArguments(
 	eval_steps=eval_and_logging_steps,
 	eval_strategy="steps",
 	save_steps=save_steps,
-	run_name=f"n={n_ahead_global}_nt={n_ahead_talk_global}_np={n_passes_global}",
+	run_name=f"d{n_ahead_global}_la{n_ahead_talk_global}_{run_id}",
 	#use_mps_device = True,
 )
 
