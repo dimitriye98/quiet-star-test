@@ -40,6 +40,7 @@ n_examples = 1_000
 full_batch_size = 8
 eval_and_logging_steps = 10
 save_steps = 100
+eval_batch_size = 512
 
 default_params = {
 	# "base_model": "mistralai/Mistral-7B-v0.1",
@@ -222,13 +223,15 @@ class TrainerWithCache(Trainer):
 		override = eval_dataset is not None
 		eval_dataset = eval_dataset if override else self.eval_dataset
 
-		hflm = HFLMThought(self.model, backend = "causal", batch_size = "auto", max_batch_size = 512, tokenizer = self.processing_class)
+		hflm = HFLMThought(self.model, backend = "causal", batch_size = 512, max_batch_size = 512, tokenizer = self.processing_class)
 
 		results = simple_evaluate(
 			model=hflm,
 			tasks=eval_dataset,
 			task_manager = self.task_manager,
 		)
+
+		self.log(results)
 
 		return { metric_key_prefix + k: v for k, v in results.items() }
 
@@ -244,7 +247,7 @@ class TrainerWithCache(Trainer):
 trainer = TrainerWithCache(
     args=training_args,
     train_dataset=train_dataset,
-    eval_dataset=["commonsense_qa"],# "gsm8k"],
+    eval_dataset=["commonsense_qa"], #"gsm8k"],
     compute_metrics=compute_metrics,
     model_init=model_init,
 	processing_class=tokenizer,
