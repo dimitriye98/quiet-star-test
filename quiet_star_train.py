@@ -61,8 +61,8 @@ default_params = {
 		lora_dropout = 0.1,
 		use_rslora = True,
 		target_modules = "all-linear",
-		exclude_modules = ".*mixer_head.*",
-		trainable_token_indices = [ ],  # Empty list is signal value for ["<thought>", "</thought>"]
+		exclude_modules = ".*(mixer_head|lm_head).*",
+		trainable_token_indices = [], # Empty list is signal value for ["<thought>", "</thought>"]
 		# modules_to_save = [m for m, _ in test_model.named_modules() if "mixer_head.mlp." in m],
 		modules_to_save = [ "mixer_head" ],
 	),
