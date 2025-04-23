@@ -170,7 +170,7 @@ training_args = TrainingArguments(
 	eval_steps=eval_and_logging_steps,
 	eval_strategy="steps",
 	save_steps=save_steps,
-	run_name=f"d{n_ahead_global}_la{n_ahead_talk_global}_{timestamp.isoformat()}",
+	run_name=f"d{n_ahead_global}_la{n_ahead_talk_global}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}",
 	#use_mps_device = True,
 )
 
