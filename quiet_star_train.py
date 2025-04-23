@@ -1,5 +1,6 @@
 import contextlib
 import copy
+from datetime import datetime
 from typing import Optional, Union, Callable, Any
 
 import torch
@@ -147,9 +148,10 @@ print("Loaded datasets")
 
 batch_size = full_batch_size // n_passes_global
 global_gradient_accumulation_steps = full_batch_size // batch_size
-run_id = int(time.time())
+ts = int(time.time())
+timestamp = datetime.fromtimestamp(ts)
 training_args = TrainingArguments(
-	output_dir=root_prefix + f"cache/quietstar/{run_id}",
+	output_dir=root_prefix + f"cache/quietstar/{ts}",
 	report_to = "wandb",
 	learning_rate=1e-6,
 	optim="adamw_torch_fused" if torch.cuda.is_available() or torch.backends.mps.is_available() else "adamw_torch",
@@ -168,7 +170,7 @@ training_args = TrainingArguments(
 	eval_steps=eval_and_logging_steps,
 	eval_strategy="steps",
 	save_steps=save_steps,
-	run_name=f"d{n_ahead_global}_la{n_ahead_talk_global}_{run_id}",
+	run_name=f"d{n_ahead_global}_la{n_ahead_talk_global}_{timestamp.isoformat()}",
 	#use_mps_device = True,
 )
 
