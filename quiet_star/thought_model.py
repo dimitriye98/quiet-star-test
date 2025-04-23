@@ -409,7 +409,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		cross_entropy_loss = cross_entropy_loss.masked_fill(
 			x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
 		# Pool loss per thought
-		cross_entropy_loss = x.reduce( "b n [d] l", cross_entropy_loss, op = t.nanmean )
+		# cross_entropy_loss = x.reduce( "b n [d] l", cross_entropy_loss, op = t.nanmean )
+		cross_entropy_loss = t.nanmean( cross_entropy_loss, dim = 2 )
 
 		# Compute REINFORCE loss
 		r = -cross_entropy_loss
@@ -425,7 +426,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			reduction = "none" ).reshape_as( thought_targets )
 		thought_loss = thought_loss.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
 		# Pool loss per thought
-		thought_loss = x.reduce( "b n [d] l", thought_loss, op = t.nanmean ) * reward
+		# thought_loss = x.reduce( "b n [d] l", thought_loss, op = t.nanmean ) * reward
+		thought_loss = t.nanmean( thought_loss, dim = 2 ) * reward
 
 		# # Compute confidence loss
 		# conf_alpha = alpha[ ..., 1:, :-(self.look_ahead - 1), : ]
@@ -454,9 +456,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			"thought_loss_avg": t.nanmean( thought_loss ).item(),
 			"thought_loss_min": nanmin( thought_loss ).item(),
 			"thought_loss_max": nanmax( thought_loss ).item(),
-			"alpha_avg": t.nanmean( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
-			"alpha_min": nanmin( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
-			"alpha_max": nanmax( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+			# "alpha_avg": t.nanmean( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+			# "alpha_min": nanmin( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+			# "alpha_max": nanmax( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+			"alpha_avg": t.nanmean( t.nanmean(alpha, dim = 2) ).item(),
+			"alpha_min": nanmin( t.nanmean(alpha, dim = 2) ).item(),
+			"alpha_max": nanmax( t.nanmean(alpha, dim = 2) ).item(),
 			"r_avg": t.nanmean( r ).item(),
 			"r_min": nanmin( r ).item(),
 			"r_max": nanmax( r ).item(),

@@ -178,7 +178,7 @@ training_args = TrainingArguments(
 	eval_strategy = "steps",
 	save_steps = save_steps,
 	run_name = f"n{ default_params[ 'n_thoughts' ] }_d{default_params[ 'thought_depth' ]}_la{default_params[ 'look_ahead' ]}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}",
-	# use_mps_device = True,
+	torch_compile = True,
 )
 
 
