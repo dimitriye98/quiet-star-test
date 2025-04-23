@@ -423,7 +423,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			thought_logits.reshape( -1, v ) / self.reinforce_temperature, thought_targets.reshape( -1 ),
 			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
 			reduction = "none" ).reshape_as( thought_targets )
-		thought_loss = thought_loss.masked_fill( (~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
+		thought_loss = thought_loss.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
 		# Pool loss per thought
 		thought_loss = x.reduce( "b n [d] l", thought_loss, op = t.nanmean ) * reward
 
