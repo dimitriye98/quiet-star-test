@@ -230,10 +230,11 @@ class TrainerWithCache(Trainer):
 			tasks=eval_dataset,
 			task_manager = self.task_manager,
 		)
+		results = { metric_key_prefix + k: v for k, v in results["results"].items() }
 
 		self.log(results)
 
-		return { metric_key_prefix + k: v for k, v in results.items() }
+		return results
 
 	def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
 		inputs["past_key_values"] = DynamicCache()
