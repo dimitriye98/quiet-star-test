@@ -258,8 +258,8 @@ class TrainerWithCache( Trainer ):
 		return results
 
 	def compute_loss( self, model, inputs, return_outputs = False, num_items_in_batch = None ):
-		cache_len = (inputs.shape[ -1 ] - model.look_ahead) * (model.thought_depth + 2 + model.look_ahead)
-		cache_batch = inputs.shape[ 0 ] * model.n_thoughts
+		cache_len = (inputs[ "input_ids" ].shape[ -1 ] - model.look_ahead) * (model.thought_depth + 2 + model.look_ahead)
+		cache_batch = inputs[ "input_ids" ].shape[ 0 ] * model.n_thoughts
 		inputs[ "past_key_values" ] = StaticCache(
 			max_cache_len = cache_len,
 			max_batch_size = cache_batch,
