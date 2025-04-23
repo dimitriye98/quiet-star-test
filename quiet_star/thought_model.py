@@ -182,6 +182,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.look_ahead_pass = config.look_ahead_pass
 		self.mixer_config = config.mixer_config
 		self.n_thoughts = config.n_thoughts
+		self.reinforce_temperature = config.reinforce_temperature
 		self.thought_depth = config.thought_depth
 		self.thought_temperature = config.thought_temperature
 
