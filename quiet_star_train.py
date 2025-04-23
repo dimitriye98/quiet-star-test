@@ -219,7 +219,8 @@ class TrainerWithCache(Trainer):
 			self,
 			eval_dataset = None,
 			ignore_keys = None,
-			metric_key_prefix: str = "eval_" ) -> dict[ str, float ]:
+			metric_key_prefix: str = "eval" ) -> dict[ str, float ]:
+		metric_key_prefix = "eval_"
 		override = eval_dataset is not None
 		eval_dataset = eval_dataset if override else self.eval_dataset
 
