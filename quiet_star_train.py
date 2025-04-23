@@ -16,8 +16,9 @@ from quiet_star import ThoughtModelConfig
 
 torch.backends.cuda.matmul.allow_tf32 = True
 import random
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel, DynamicCache, PreTrainedModel, DataCollator, \
-	PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin, EvalPrediction, TrainerCallback
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel, PreTrainedModel, DataCollator, \
+	PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin, EvalPrediction, \
+	TrainerCallback, StaticCache
 from datasets import load_dataset
 from transformers import TrainingArguments, Trainer
 import os
@@ -62,7 +63,7 @@ default_params = {
 		use_rslora = True,
 		target_modules = "all-linear",
 		exclude_modules = ".*(mixer_head|lm_head).*",
-		trainable_token_indices = [], # Empty list is signal value for ["<thought>", "</thought>"]
+		trainable_token_indices = [ ],  # Empty list is signal value for ["<thought>", "</thought>"]
 		# modules_to_save = [m for m, _ in test_model.named_modules() if "mixer_head.mlp." in m],
 		modules_to_save = [ "mixer_head" ],
 	),
@@ -177,7 +178,7 @@ training_args = TrainingArguments(
 	eval_steps = eval_and_logging_steps,
 	eval_strategy = "steps",
 	save_steps = save_steps,
-	run_name = f"n{ default_params[ 'n_thoughts' ] }_d{default_params[ 'thought_depth' ]}_la{default_params[ 'look_ahead' ]}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}",
+	run_name = f"n{default_params[ 'n_thoughts' ]}_d{default_params[ 'thought_depth' ]}_la{default_params[ 'look_ahead' ]}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}",
 	torch_compile = True,
 )
 
@@ -198,7 +199,7 @@ class HFLMThought( HFLM ):
 		assert self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
 		with torch.inference_mode():
 			# Greedy decoding for thoughts during evaluation
-			return self.model(inps, thought_temperature = 0.0 ).logits
+			return self.model( inps, thought_temperature = 0.0 ).logits
 
 	def _select_cont_toks( self, logits: torch.Tensor, contlen: int = None, inplen: int = None ) -> torch.Tensor:
 		# The default implementation of HFLM assumes logits are emitted for
@@ -257,7 +258,15 @@ class TrainerWithCache( Trainer ):
 		return results
 
 	def compute_loss( self, model, inputs, return_outputs = False, num_items_in_batch = None ):
-		inputs[ "past_key_values" ] = DynamicCache()
+		cache_len = (inputs.shape[ -1 ] - model.look_ahead) * (model.thought_depth + 2 + model.look_ahead)
+		cache_batch = inputs.shape[ 0 ] * model.n_thoughts
+		inputs[ "past_key_values" ] = StaticCache(
+			max_cache_len = cache_len,
+			max_batch_size = cache_batch,
+			device = model.device,
+			dtype = model.dtype,
+			config = model.lm_model.config,
+		)
 
 		with cm_memory() if torch.cuda.is_available() else contextlib.nullcontext():
 			loss, o = super().compute_loss(
