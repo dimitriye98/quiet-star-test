@@ -33,6 +33,7 @@ dataset_name = 'open-web-math/open-web-math'
 project_name = "quiet-star"
 os.environ["WANDB_PROJECT"] = project_name + "-" + dataset_name.split("/")[-1]
 os.environ["WANDB_CACHE_DIR"] = wandb_cache_dir
+os.environ["WANDB_LOG_MODEL"] = "checkpoint"
 n_ahead_talk_global = 4
 n_passes_global = 8
 n_ahead_global = 12
