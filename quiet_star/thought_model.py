@@ -450,25 +450,25 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		loss = t.nanmean( loss )
 
 		stats = {
-			"cross_entropy_avg": t.nanmean( cross_entropy_loss ).item(),
-			"cross_entropy_min": nanmin( cross_entropy_loss ).item(),
-			"cross_entropy_max": nanmax( cross_entropy_loss ).item(),
-			"thought_loss_avg": t.nanmean( thought_loss ).item(),
-			"thought_loss_min": nanmin( thought_loss ).item(),
-			"thought_loss_max": nanmax( thought_loss ).item(),
-			# "alpha_avg": t.nanmean( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
-			# "alpha_min": nanmin( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
-			# "alpha_max": nanmax( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
-			"alpha_avg": t.nanmean( t.nanmean(alpha, dim = 2) ).item(),
-			"alpha_min": nanmin( t.nanmean(alpha, dim = 2) ).item(),
-			"alpha_max": nanmax( t.nanmean(alpha, dim = 2) ).item(),
-			"r_avg": t.nanmean( r ).item(),
-			"r_min": nanmin( r ).item(),
-			"r_max": nanmax( r ).item(),
-			"reward_avg": t.nanmean( reward ).item(),
-			"reward_min": nanmin( reward ).item(),
-			"reward_max": nanmax( reward ).item(),
-			"loss": loss.item()
+			"cross_entropy_avg": t.nanmean( cross_entropy_loss ).detach(),
+			"cross_entropy_min": nanmin( cross_entropy_loss ).detach(),
+			"cross_entropy_max": nanmax( cross_entropy_loss ).detach(),
+			"thought_loss_avg": t.nanmean( thought_loss ).detach(),
+			"thought_loss_min": nanmin( thought_loss ).detach(),
+			"thought_loss_max": nanmax( thought_loss ).detach(),
+			# "alpha_avg": t.nanmean( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).detach(),
+			# "alpha_min": nanmin( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).detach(),
+			# "alpha_max": nanmax( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).detach(),
+			"alpha_avg": t.nanmean( t.nanmean(alpha, dim = 2) ).detach(),
+			"alpha_min": nanmin( t.nanmean(alpha, dim = 2) ).detach(),
+			"alpha_max": nanmax( t.nanmean(alpha, dim = 2) ).detach(),
+			"r_avg": t.nanmean( r ).detach(),
+			"r_min": nanmin( r ).detach(),
+			"r_max": nanmax( r ).detach(),
+			"reward_avg": t.nanmean( reward ).detach(),
+			"reward_min": nanmin( reward ).detach(),
+			"reward_max": nanmax( reward ).detach(),
+			"loss": loss.detach()
 		}
 
 		return loss, logits, stats
@@ -480,6 +480,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		else:
 			raise NotImplementedError( "Only DynamicCache is supported" )
 
+	@t.compiler.disable()
 	@t.inference_mode()
 	def inference_forward(
 			self, input_ids, padding_mask, thought_temperature, *, kv_cache = None, cache_pos = None,
@@ -545,6 +546,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		assert out.shape == (b, 1, self.config.text_config.vocab_size)
 		return out
 
+	@t.compiler.disable(recursive = False)
 	def forward(
 			self,
 			input_ids = None,
