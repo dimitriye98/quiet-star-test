@@ -112,9 +112,10 @@ class ThoughtModelConfig( PretrainedConfig ):
 			look_ahead_pass: int = None,
 			n_thoughts: int = 2,
 			pad_token_id: int = None,
+			reinforce_temperature: float = 3.0,
 			start_thought_token_id: int = None,
 			thought_depth: int = 12,
-			thought_temperature: float = 0.0,
+			thought_temperature: float = 1.0,
 
 			mixer_config: dict | MixerConfig = None,
 			text_config: dict | PretrainedConfig = None,
@@ -127,6 +128,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.look_ahead_pass = look_ahead_pass
 		self.n_thoughts = n_thoughts
 		self.pad_token_id = pad_token_id
+		self.reinforce_temperature = reinforce_temperature
 		self.start_thought_token_id = start_thought_token_id
 		self.thought_depth = thought_depth
 		self.thought_temperature = thought_temperature
@@ -417,7 +419,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		thought_targets = ts[ ..., 2:2 + self.thought_depth, : ]
 		v = thought_logits.shape[ -1 ]
 		thought_loss = t.nn.functional.cross_entropy(
-			thought_logits.reshape( -1, v ), thought_targets.reshape( -1 ),
+			thought_logits.reshape( -1, v ) / self.reinforce_temperature, thought_targets.reshape( -1 ),
 			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
 			reduction = "none" ).reshape_as( thought_targets )
 		thought_loss = thought_loss.masked_fill( (~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
