@@ -53,19 +53,19 @@ default_params = {
 		# "cache_dir": root_prefix + "cache",
 	},
 	"tokenizer_kwargs": {
-		"padding_side": "right",
+		"padding_side": "left",
 	},
-	"peft_config": LoraConfig(
-		r = 32,
-		lora_alpha = 64,
-		lora_dropout = 0.1,
-		use_rslora = True,
-		target_modules = "all-linear",
-		exclude_modules = ".*(mixer_head|lm_head).*",
-		trainable_token_indices = [], # Empty list is signal value for ["<thought>", "</thought>"]
-		# modules_to_save = [m for m, _ in test_model.named_modules() if "mixer_head.mlp." in m],
-		modules_to_save = [ "mixer_head" ],
-	),
+#	"peft_config": LoraConfig(
+#		r = 32,
+#		lora_alpha = 64,
+#		lora_dropout = 0.1,
+#		use_rslora = True,
+#		target_modules = "all-linear",
+#		exclude_modules = ".*(mixer_head|lm_head).*",
+#		trainable_token_indices = [], # Empty list is signal value for ["<thought>", "</thought>"]
+#		# modules_to_save = [m for m, _ in test_model.named_modules() if "mixer_head.mlp." in m],
+#		modules_to_save = [ "mixer_head" ],
+#	),
 	"n_thoughts": 2,
 	"thought_depth": 12,
 	"look_ahead": 4,
