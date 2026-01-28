@@ -20,7 +20,7 @@ class WeightedMixerHead( t.nn.Module ):
 
 	def forward( self, pre_thought_hidden_state, post_thought_hidden_state ):
 		catted_states = t.cat( (pre_thought_hidden_state, post_thought_hidden_state), dim = -1 )
-		return self.mlp( catted_states )
+		return t.sigmoid(self.mlp( catted_states ))
 
 
 # class ConfidenceHead( t.nn.Module ):
@@ -212,7 +212,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			if self.config.stt_init_id is not None:
 				self.lm_model.model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.model.embed_tokens.weight[ self.config.stt_init_id ]
 			if self.config.ett_init_id is not None:
-				self.lm_model.model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.model.embed_tokens.weight[ self.config.ett_init_id ]
+				self.lm_model.model.embed_tokens.weight[ self.end_thought_token_id ] = self.lm_model.model.embed_tokens.weight[ self.config.ett_init_id ]
 
 
 	@staticmethod
