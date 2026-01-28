@@ -33,14 +33,14 @@ random.seed( random_seed )
 root_prefix = "."
 wandb_cache_dir = root_prefix + "cache/quietstar/wandb_cache"
 dataset_name = 'open-web-math/open-web-math'
-train_snippet_length = 256
+train_snippet_length = 96
 # dataset_name = 'c4'
 project_name = "quiet-star"
 os.environ[ "WANDB_PROJECT" ] = project_name + "-" + dataset_name.split( "/" )[ -1 ]
 os.environ[ "WANDB_CACHE_DIR" ] = wandb_cache_dir
 os.environ[ "WANDB_LOG_MODEL" ] = "checkpoint"
 n_examples = 1_000
-full_batch_size = 8
+full_batch_size = 16
 eval_and_logging_steps = 100
 save_steps = 500
 eval_batch_size = 512
@@ -69,8 +69,11 @@ default_params = {
 #		modules_to_save = [ "mixer_head" ],
 #	),
 	"n_thoughts": 2,
-	"thought_depth": 12,
+	"thought_depth": 8,
 	"look_ahead": 4,
+	"stt_init_id": "---",
+	"ett_init_id": "---",
+	"embedding_scale": 100.0,
 	#"look_ahead_pass": 1,
 }
 
@@ -109,6 +112,13 @@ def model_init( p ):
 	special_tokens_to_add = [ "<thought>", "</thought>" ]
 	tokenizer.add_special_tokens( { "additional_special_tokens": special_tokens_to_add } )
 	lm_model.resize_token_embeddings( len( tokenizer ) )
+
+	stt_init_id = params.pop( "stt_init_id", None )
+	ett_init_id = params.pop( "ett_init_id", None )
+
+	params["stt_init_id"] = tokenizer.convert_tokens_to_ids( stt_init_id )
+	params["ett_init_id"] = tokenizer.convert_tokens_to_ids( ett_init_id )
+
 
 	params[ "start_thought_token_id" ] = tokenizer.convert_tokens_to_ids( "<thought>" )
 	params[ "end_thought_token_id" ] = tokenizer.convert_tokens_to_ids( "</thought>" )

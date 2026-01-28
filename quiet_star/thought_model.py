@@ -1,3 +1,4 @@
+from typing import override
 import einx as x
 import torch as t
 from transformers import GenerationMixin, PreTrainedModel, DynamicCache, PretrainedConfig, AutoConfig, AutoModel
@@ -108,6 +109,9 @@ class ThoughtModelConfig( PretrainedConfig ):
 			beta_cross_entropy: float = 1.0,
 			beta_thought: float = 1e6,
 			end_thought_token_id: int = None,
+			embedding_scale: float = 1.0,
+			stt_init_id: int = None,
+			ett_init_id: int = None,
 			look_ahead: int = 4,
 			look_ahead_pass: int = None,
 			n_thoughts: int = 2,
@@ -124,6 +128,9 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.beta_cross_entropy = beta_cross_entropy
 		self.beta_thought = beta_thought
 		self.end_thought_token_id = end_thought_token_id
+		self.embedding_scale = embedding_scale
+		self.stt_init_id = stt_init_id
+		self.ett_init_id = ett_init_id
 		self.look_ahead = look_ahead
 		self.look_ahead_pass = look_ahead_pass
 		self.n_thoughts = n_thoughts
@@ -189,7 +196,22 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.lm_model = lm_model if lm_model is not None else AutoModel.from_config( config.text_config )
 		self.mixer_head = WeightedMixerHead( config, lm_model.config.hidden_size )
 
+		embedding_scaling_mask = t.ones_like( self.lm_model.embed_tokens.weight )
+		embedding_scaling_mask[ self.start_thought_token_id ] *= config.embedding_scale
+		embedding_scaling_mask[ self.end_thought_token_id ] *= config.embedding_scale
+		self.lm_model.embeddings.token_embedding.weight.register_hook( lambda grad: grad * embedding_scaling_mask )
+
 		self.post_init()
+
+	@override
+	def post_init(self):
+		super().post_init()
+
+		if self.config.stt_init_id is not None:
+			self.lm_model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.embed_tokens.weight[ self.config.stt_init_id ]
+		if self.config.ett_init_id is not None:
+			self.lm_model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.embed_tokens.weight[ self.config.ett_init_id ]
+
 
 	@staticmethod
 	def construct_thought_mask( b, n, d, l, padding_mask, dtype ):
