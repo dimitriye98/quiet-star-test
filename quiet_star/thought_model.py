@@ -196,10 +196,10 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.lm_model = lm_model if lm_model is not None else AutoModel.from_config( config.text_config )
 		self.mixer_head = WeightedMixerHead( config, lm_model.config.hidden_size )
 
-		embedding_scaling_mask = t.ones_like( self.lm_model.embed_tokens.weight )
+		embedding_scaling_mask = t.ones_like( self.lm_model.model.embed_tokens.weight )
 		embedding_scaling_mask[ self.start_thought_token_id ] *= config.embedding_scale
 		embedding_scaling_mask[ self.end_thought_token_id ] *= config.embedding_scale
-		self.lm_model.embeddings.token_embedding.weight.register_hook( lambda grad: grad * embedding_scaling_mask )
+		self.lm_model.model.embed_tokens.weight.register_hook( lambda grad: grad * embedding_scaling_mask )
 
 		self.post_init()
 
@@ -207,10 +207,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 	def post_init(self):
 		super().post_init()
 
-		if self.config.stt_init_id is not None:
-			self.lm_model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.embed_tokens.weight[ self.config.stt_init_id ]
-		if self.config.ett_init_id is not None:
-			self.lm_model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.embed_tokens.weight[ self.config.ett_init_id ]
+
+		with t.no_grad():
+			if self.config.stt_init_id is not None:
+				self.lm_model.model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.model.embed_tokens.weight[ self.config.stt_init_id ]
+			if self.config.ett_init_id is not None:
+				self.lm_model.model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.model.embed_tokens.weight[ self.config.ett_init_id ]
 
 
 	@staticmethod
