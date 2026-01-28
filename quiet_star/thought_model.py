@@ -203,7 +203,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		range_L = x.rearrange( "L -> D L d l", t.arange( l, device = device ), l = l, d = d, D = d, L = l )
 
 		# Allow attention only for tokens which precede in depth, or are in the initial input sequence and precede in time
-		countercausal_mask = (range_D <= range_d) | ((range_d == 0) & (range_L <= range_l))
+		countercausal_mask = ((range_d <= range_D) & (range_l == range_L)) | ((range_d == 0) & (range_l <= range_L))
 		countercausal_mask = x.rearrange(
 			"D L d l -> b n D L d l", countercausal_mask, b = b, n = n, d = d, l = l, D = d, L = l )
 		padding_mask = x.rearrange( "b n l -> b n D L d l", padding_mask, b = b, n = n, d = d, l = l, D = d, L = l )
@@ -300,7 +300,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		start_toks = t.full(
 			(ts.shape[ 0 ], ts.shape[ 1 ], 1, ts.shape[ 3 ]), self.start_thought_token_id, device = ts.device,
 			dtype = ts.dtype )
-		ts = t.cat( (start_toks, ts), dim = -2 )
+		ts = t.cat( (ts, start_toks), dim = -2 )
 
 		# rank-6 mask of shape (b, n, d, l, d, l)
 		thought_mask = self.construct_thought_mask(
@@ -323,12 +323,14 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				layers_cached,
 				layer_to_gen,
 				slice_mask )  # Discard hidden states
+
 			if i == 0:
 				thought_logits = new_logs
 			else:
 				thought_logits = t.cat( (thought_logits, new_logs), dim = -3 )
 
 			new_toks = self.sample_thoughts( new_logs, thought_temperature ).detach()
+
 
 			layers_cached = layer_to_gen
 			layer_to_gen += 1

@@ -2,6 +2,7 @@ import contextlib
 import copy
 from datetime import datetime
 from typing import Optional, Union, Callable, Any
+from functools import partial
 
 import torch
 import transformers
@@ -32,6 +33,7 @@ random.seed( random_seed )
 root_prefix = "."
 wandb_cache_dir = root_prefix + "cache/quietstar/wandb_cache"
 dataset_name = 'open-web-math/open-web-math'
+train_snippet_length = 256
 # dataset_name = 'c4'
 project_name = "quiet-star"
 os.environ[ "WANDB_PROJECT" ] = project_name + "-" + dataset_name.split( "/" )[ -1 ]
@@ -39,8 +41,8 @@ os.environ[ "WANDB_CACHE_DIR" ] = wandb_cache_dir
 os.environ[ "WANDB_LOG_MODEL" ] = "checkpoint"
 n_examples = 1_000
 full_batch_size = 8
-eval_and_logging_steps = 10
-save_steps = 100
+eval_and_logging_steps = 100
+save_steps = 500
 eval_batch_size = 512
 
 default_params = {
@@ -69,7 +71,7 @@ default_params = {
 	"n_thoughts": 2,
 	"thought_depth": 12,
 	"look_ahead": 4,
-	"look_ahead_pass": 1,
+	#"look_ahead_pass": 1,
 }
 
 tokenizer_args = default_params.pop( "tokenizer_args", [ ] )
@@ -143,7 +145,7 @@ dataset = load_dataset(
 )
 
 train_dataset = dataset.shuffle( seed = random_seed ).map(
-	preprocess_function, batched = True, writer_batch_size = 200 )
+	partial(preprocess_function, max_length=train_snippet_length), batched = True, writer_batch_size = 200 )
 # eval_dataset_gsm = load_dataset("gsm8k", "main", split="test").map(preprocess_eval_function_gsm, batched=True, writer_batch_size=200)
 # eval_dataset_csqa = load_dataset("tau/commonsense_qa", "default", split="validation").map(preprocess_eval_function_csqa, batched=True, writer_batch_size=200)
 print( "Loaded datasets" )
