@@ -426,21 +426,44 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		alpha = self.mixer_head( prior_hidden_states.expand_as( post_hidden_states ), post_hidden_states )
 		logits = alpha * post_logits + (1 - alpha) * prior_logits
 
+
+
 		# Compute cross entropy loss
 		v = logits.shape[ -1 ]
+		mask = x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ]
 		cross_entropy_loss = t.nn.functional.cross_entropy(
 			logits.reshape( -1, v ), targets.reshape( -1 ),
 			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
 			reduction = "none" ).reshape_as( targets )
-		cross_entropy_loss = cross_entropy_loss.masked_fill(
-			x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
+		cross_entropy_loss = cross_entropy_loss.masked_fill( mask, t.nan )
 		# Pool loss per thought
 		cross_entropy_loss = x.reduce( "b n [d] l", cross_entropy_loss, op = t.nanmean )
 
-		# Compute REINFORCE loss
-		r = -cross_entropy_loss
-		r_mean = x.mean( "b [n] l -> b 1 l", r )
-		reward = t.nn.functional.relu( r - r_mean ).detach()
+		# Compute loss on PRIOR logits (no thought baseline)
+		prior_loss = t.nn.functional.cross_entropy(
+			prior_logits.expand_as(logits).reshape(-1, v), targets.reshape(-1),
+			ignore_index=self.pad_token_id if self.pad_token_id is not None else -100,
+			reduction="none").reshape_as(targets)
+		prior_loss = prior_loss.masked_fill( mask, t.nan )
+		prior_loss = x.reduce("b n [d] l", prior_loss, op=t.nanmean)
+
+		# Compute loss on POST logits (pure thought output, NOT mixed)
+		post_loss = t.nn.functional.cross_entropy(
+			post_logits.reshape(-1, v), targets.reshape(-1),
+			ignore_index=self.pad_token_id if self.pad_token_id is not None else -100,
+			reduction="none").reshape_as(targets)
+		post_loss = post_loss.masked_fill( mask, t.nan )
+		post_loss = x.reduce("b n [d] l", post_loss, op=t.nanmean)
+
+		# Reward = how much did thinking help vs not thinking?
+		# Positive means thought reduced loss
+		reward = (prior_loss - post_loss).detach()
+		reward = t.nn.functional.relu(reward)  # Only reinforce helpful thoughts
+
+		# # Compute REINFORCE loss
+		# r = -cross_entropy_loss
+		# r_mean = x.mean( "b [n] l -> b 1 l", r )
+		# reward = t.nn.functional.relu( r - r_mean ).detach()
 
 		# Apply REINFORCE loss
 		thought_targets = ts[ ..., 2:2 + self.thought_depth, : ]
@@ -474,6 +497,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		loss = t.nanmean( loss )
 
 		stats = {
+			"prior_loss_avg": t.nanmean( prior_loss ).item(),
+			"prior_loss_min": nanmin( prior_loss ).item(),
+			"prior_loss_max": nanmax( prior_loss ).item(),
+			"posterior_loss_avg": t.nanmean( post_loss ).item(),
+			"posterior_loss_min": nanmin( post_loss ).item(),
+			"posterior_loss_max": nanmax( post_loss ).item(),
 			"cross_entropy_avg": t.nanmean( cross_entropy_loss ).item(),
 			"cross_entropy_min": nanmin( cross_entropy_loss ).item(),
 			"cross_entropy_max": nanmax( cross_entropy_loss ).item(),
@@ -483,9 +512,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			"alpha_avg": t.nanmean( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
 			"alpha_min": nanmin( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
 			"alpha_max": nanmax( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
-			"r_avg": t.nanmean( r ).item(),
-			"r_min": nanmin( r ).item(),
-			"r_max": nanmax( r ).item(),
+#			"r_avg": t.nanmean( r ).item(),
+#			"r_min": nanmin( r ).item(),
+#			"r_max": nanmax( r ).item(),
 			"reward_avg": t.nanmean( reward ).item(),
 			"reward_min": nanmin( reward ).item(),
 			"reward_max": nanmax( reward ).item(),
