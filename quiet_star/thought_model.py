@@ -107,7 +107,8 @@ class ThoughtModelConfig( PretrainedConfig ):
 			self,
 			*,
 			beta_cross_entropy: float = 1.0,
-			beta_thought: float = 1e6,
+			beta_stability: float = 1.0,
+			beta_thought: float = 1.0,
 			end_thought_token_id: int = None,
 			embedding_scale: float = 1.0,
 			stt_init_id: int = None,
@@ -126,6 +127,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			**kwargs ):
 
 		self.beta_cross_entropy = beta_cross_entropy
+		self.beta_stability = beta_stability
 		self.beta_thought = beta_thought
 		self.end_thought_token_id = end_thought_token_id
 		self.embedding_scale = embedding_scale
@@ -184,6 +186,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.pad_token_id = config.pad_token_id
 
 		self.beta_cross_entropy = config.beta_cross_entropy
+		self.beta_stability = config.beta_stability
 		self.beta_thought = config.beta_thought
 		self.look_ahead = config.look_ahead
 		self.look_ahead_pass = config.look_ahead_pass
@@ -415,7 +418,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		# Logits without thought
 		prior_logits, prior_hidden_states = self.naive_forward(
-			input_ids[ :, :-1 ], padding_mask[ :, :-1 ], keep = self.look_ahead )
+			input_ids[ :, :-1 ], padding_mask[ :, :-1 ], keep = input_ids.shape[-1] )
 		prior_logits = prior_logits.unfold( -2, self.look_ahead, 1 )
 		# prior_logits = t.movedim( prior_logits, -1, -3 )  # b l v d -> b d l v
 		prior_logits = x.rearrange( "b l v d -> b n d l v", prior_logits, n = self.n_thoughts )
@@ -428,19 +431,41 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		# Compute cross entropy loss
 		v = logits.shape[ -1 ]
-		cross_entropy_loss = t.nn.functional.cross_entropy(
+		mixed_cross_entropy_loss = t.nn.functional.cross_entropy(
 			logits.reshape( -1, v ), targets.reshape( -1 ),
 			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
 			reduction = "none" ).reshape_as( targets )
-		cross_entropy_loss = cross_entropy_loss.masked_fill(
+		mixed_cross_entropy_loss = mixed_cross_entropy_loss.masked_fill(
 			x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
 		# Pool loss per thought
-		cross_entropy_loss = x.reduce( "b n [d] l", cross_entropy_loss, op = t.nanmean )
+		mixed_cross_entropy_loss = x.reduce( "b n [d] l", mixed_cross_entropy_loss, op = t.nanmean )
+
+		# Compute prior cross entropy loss
+		v = prior_logits.shape[ -1 ]
+		prior_cross_entropy_loss = t.nn.functional.cross_entropy(
+			prior_logits.reshape( -1, v ), targets.reshape( -1 ),
+			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
+			reduction = "none" ).reshape_as( targets )
+		prior_cross_entropy_loss = prior_cross_entropy_loss.masked_fill(
+			x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
+		# Pool loss per thought
+		prior_cross_entropy_loss = x.reduce( "b n [d] l", prior_cross_entropy_loss, op = t.nanmean )
+
+		# Compute posterior cross entropy loss
+		v = post_logits.shape[ -1 ]
+		post_cross_entropy_loss = t.nn.functional.cross_entropy(
+			post_logits.reshape( -1, v ), targets.reshape( -1 ),
+			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
+			reduction = "none" ).reshape_as( targets )
+		post_cross_entropy_loss = post_cross_entropy_loss.masked_fill(
+			x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
+		# Pool loss per thought
+		post_cross_entropy_loss = x.reduce( "b n [d] l", post_cross_entropy_loss, op = t.nanmean )
 
 		# Compute REINFORCE loss
-		r = -cross_entropy_loss
+		r = -post_cross_entropy_loss
 		r_mean = x.mean( "b [n] l -> b 1 l", r )
-		reward = t.nn.functional.relu( r - r_mean ).detach()
+		advantage = t.nn.functional.relu( r - r_mean ).detach()
 
 		# Apply REINFORCE loss
 		thought_targets = ts[ ..., 2:2 + self.thought_depth, : ]
@@ -451,7 +476,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			reduction = "none" ).reshape_as( thought_targets )
 		thought_loss = thought_loss.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
 		# Pool loss per thought
-		thought_loss = x.reduce( "b n [d] l", thought_loss, op = t.nanmean ) * reward
+		thought_loss = x.reduce( "b n [d] l", thought_loss, op = t.nanmean ) * advantage
 
 		# # Compute confidence loss
 		# conf_alpha = alpha[ ..., 1:, :-(self.look_ahead - 1), : ]
@@ -470,13 +495,19 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# confidence_loss = confidence_loss.masked_fill( padding_mask[ ..., :-(2 * self.look_ahead - 1) ], t.nan )
 		# confidence_loss = x.reduce( "b n [d] l", confidence_loss, op = "nanmean" )
 
-		loss = self.beta_cross_entropy * cross_entropy_loss + self.beta_thought * thought_loss
+		loss = self.beta_cross_entropy * mixed_cross_entropy_loss + self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss
 		loss = t.nanmean( loss )
 
 		stats = {
-			"cross_entropy_avg": t.nanmean( cross_entropy_loss ).item(),
-			"cross_entropy_min": nanmin( cross_entropy_loss ).item(),
-			"cross_entropy_max": nanmax( cross_entropy_loss ).item(),
+			"mixed_cross_entropy_avg": t.nanmean( mixed_cross_entropy_loss ).item(),
+			"mixed_cross_entropy_min": nanmin( mixed_cross_entropy_loss ).item(),
+			"mixed_cross_entropy_max": nanmax( mixed_cross_entropy_loss ).item(),
+			"prior_cross_entropy_avg": t.nanmean( prior_cross_entropy_loss ).item(),
+			"prior_cross_entropy_min": nanmin( prior_cross_entropy_loss ).item(),
+			"prior_cross_entropy_max": nanmax( prior_cross_entropy_loss ).item(),
+			"posterior_cross_entropy_avg": t.nanmean( post_cross_entropy_loss ).item(),
+			"posterior_cross_entropy_min": nanmin( post_cross_entropy_loss ).item(),
+			"posterior_cross_entropy_max": nanmax( post_cross_entropy_loss ).item(),
 			"thought_loss_avg": t.nanmean( thought_loss ).item(),
 			"thought_loss_min": nanmin( thought_loss ).item(),
 			"thought_loss_max": nanmax( thought_loss ).item(),
@@ -486,9 +517,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			"r_avg": t.nanmean( r ).item(),
 			"r_min": nanmin( r ).item(),
 			"r_max": nanmax( r ).item(),
-			"reward_avg": t.nanmean( reward ).item(),
-			"reward_min": nanmin( reward ).item(),
-			"reward_max": nanmax( reward ).item(),
+			"advantage_avg": t.nanmean( advantage ).item(),
+			"advantage_min": nanmin( advantage ).item(),
+			"advantage_max": nanmax( advantage ).item(),
 			"loss": loss.item()
 		}
 
