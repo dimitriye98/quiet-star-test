@@ -463,7 +463,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		post_cross_entropy_loss = x.reduce( "b n [d] l", post_cross_entropy_loss, op = t.nanmean )
 
 		# Compute REINFORCE loss
-		r = -post_cross_entropy_loss
+		r = prior_cross_entropy_loss - post_cross_entropy_loss
 		r_mean = x.mean( "b [n] l -> b 1 l", r )
 		advantage = t.nn.functional.relu( r - r_mean ).detach()
 
