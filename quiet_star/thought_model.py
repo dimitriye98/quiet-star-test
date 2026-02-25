@@ -268,7 +268,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		a_mask = x.rearrange( "b n D L d l -> (b n) 1 (D L) (d l)", mask )
 		input_ids = x.rearrange( "b n d l -> (b n) (d l)", ts )
 		position_ids = x.rearrange(
-			"d l -> (b n) (d l)", t.arange( l, device = ts.device ) + t.arange( d, device = ts.device ).unsqueeze( -1 ),
+			"d l -> (b n) (d l)", t.arange( l, device = ts.device ) + (t.arange( d, device = ts.device ) + layers_cached).unsqueeze( -1 ),
 			b = b, n = n )
 
 		out = self.lm_model(
