@@ -107,6 +107,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			self,
 			*,
 			beta_mixer: float = 1.0,
+			beta_posterior: float = 1.0,
 			beta_stability: float = 1.0,
 			beta_thought: float = 1.0,
 			end_thought_token_id: int = None,
@@ -127,6 +128,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			**kwargs ):
 
 		self.beta_mixer = beta_mixer
+		self.beta_posterior = beta_posterior
 		self.beta_stability = beta_stability
 		self.beta_thought = beta_thought
 		self.end_thought_token_id = end_thought_token_id
@@ -186,6 +188,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.pad_token_id = config.pad_token_id
 
 		self.beta_mixer = config.beta_mixer
+		self.beta_posterior = config.beta_posterior
 		self.beta_stability = config.beta_stability
 		self.beta_thought = config.beta_thought
 		self.look_ahead = config.look_ahead
@@ -495,7 +498,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# confidence_loss = confidence_loss.masked_fill( padding_mask[ ..., :-(2 * self.look_ahead - 1) ], t.nan )
 		# confidence_loss = x.reduce( "b n [d] l", confidence_loss, op = "nanmean" )
 
-		loss = self.beta_mixer * mixed_cross_entropy_loss + self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss
+		loss = self.beta_mixer * mixed_cross_entropy_loss + self.beta_posterior * post_cross_entropy_loss + self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss
 		loss = t.nanmean( loss )
 
 		stats = {
