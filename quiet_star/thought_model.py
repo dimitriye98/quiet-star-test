@@ -429,7 +429,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# prior_hidden_states = t.movedim( prior_hidden_states, -1, -3 )  # b l e d -> b d l e
 		prior_hidden_states = x.rearrange( "b l e d -> b n d l e", prior_hidden_states, n = self.n_thoughts )
 
-		alpha = self.mixer_head( prior_hidden_states.expand_as( post_hidden_states ).detach(), post_hidden_states.detach() )
+		alpha = self.mixer_head( prior_hidden_states.expand_as( post_hidden_states ), post_hidden_states )
 		logits = alpha * post_logits.detach() + (1 - alpha) * prior_logits.detach()
 
 		# Compute cross entropy loss
