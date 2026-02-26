@@ -121,6 +121,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			start_thought_token_id: int = None,
 			thought_depth: int = 12,
 			thought_temperature: float = 1.0,
+			use_absolute_advantage: bool = True,
 
 			mixer_config: dict | MixerConfig = None,
 			text_config: dict | PretrainedConfig = None,
@@ -141,6 +142,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.start_thought_token_id = start_thought_token_id
 		self.thought_depth = thought_depth
 		self.thought_temperature = thought_temperature
+		self.use_absolute_advantage = use_absolute_advantage
 
 		if text_config is None:
 			raise ValueError( "`text_config` must be specified" )
@@ -195,6 +197,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.reinforce_temperature = config.reinforce_temperature
 		self.thought_depth = config.thought_depth
 		self.thought_temperature = config.thought_temperature
+		self.use_absolute_advantage = config.use_absolute_advantage
 
 		self.lm_model = lm_model if lm_model is not None else AutoModel.from_config( config.text_config )
 		self.mixer_head = WeightedMixerHead( config, lm_model.config.hidden_size )
@@ -465,7 +468,11 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# Compute REINFORCE loss
 		r = prior_cross_entropy_loss - post_cross_entropy_loss
 		r_mean = x.mean( "b [n] l -> b 1 l", r )
-		advantage = t.nn.functional.relu( r - r_mean ).detach()
+		relative_advantage = t.nn.functional.relu( r - r_mean )
+		if self.use_absolute_advantage:
+			advantage = (relative_advantage + t.nn.functional.relu( r )).detach()
+		else:
+			advantage = relative_advantage.detach()
 
 		# Apply REINFORCE loss
 		thought_targets = ts[ ..., 2:2 + self.thought_depth, : ]
