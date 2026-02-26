@@ -106,7 +106,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 	def __init__(
 			self,
 			*,
-			beta_cross_entropy: float = 1.0,
+			beta_mixer: float = 1.0,
 			beta_stability: float = 1.0,
 			beta_thought: float = 1.0,
 			end_thought_token_id: int = None,
@@ -127,7 +127,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			text_config: dict | PretrainedConfig = None,
 			**kwargs ):
 
-		self.beta_cross_entropy = beta_cross_entropy
+		self.beta_mixer = beta_mixer
 		self.beta_stability = beta_stability
 		self.beta_thought = beta_thought
 		self.end_thought_token_id = end_thought_token_id
@@ -187,7 +187,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.end_thought_token_id = config.end_thought_token_id
 		self.pad_token_id = config.pad_token_id
 
-		self.beta_cross_entropy = config.beta_cross_entropy
+		self.beta_mixer = config.beta_mixer
 		self.beta_stability = config.beta_stability
 		self.beta_thought = config.beta_thought
 		self.look_ahead = config.look_ahead
@@ -429,8 +429,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# prior_hidden_states = t.movedim( prior_hidden_states, -1, -3 )  # b l e d -> b d l e
 		prior_hidden_states = x.rearrange( "b l e d -> b n d l e", prior_hidden_states, n = self.n_thoughts )
 
-		alpha = self.mixer_head( prior_hidden_states.expand_as( post_hidden_states ), post_hidden_states )
-		logits = alpha * post_logits + (1 - alpha) * prior_logits
+		alpha = self.mixer_head( prior_hidden_states.expand_as( post_hidden_states ).detach(), post_hidden_states.detach() )
+		logits = alpha * post_logits.detach() + (1 - alpha) * prior_logits.detach()
 
 		# Compute cross entropy loss
 		v = logits.shape[ -1 ]
@@ -502,7 +502,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# confidence_loss = confidence_loss.masked_fill( padding_mask[ ..., :-(2 * self.look_ahead - 1) ], t.nan )
 		# confidence_loss = x.reduce( "b n [d] l", confidence_loss, op = "nanmean" )
 
-		loss = self.beta_cross_entropy * mixed_cross_entropy_loss + self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss
+		loss = self.beta_mixer * mixed_cross_entropy_loss + self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss
 		loss = t.nanmean( loss )
 
 		stats = {
