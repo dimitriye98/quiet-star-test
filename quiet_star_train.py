@@ -190,6 +190,7 @@ training_args = TrainingArguments(
 	weight_decay = 0.001,
 	label_names = [ "labels" ],
 	include_inputs_for_metrics = True,
+	log_level = "warning",
 	logging_steps = eval_and_logging_steps,
 	eval_on_start = True,
 	eval_steps = eval_and_logging_steps,
