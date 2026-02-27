@@ -39,7 +39,7 @@ project_name = "quiet-star"
 os.environ[ "WANDB_PROJECT" ] = project_name + "-" + dataset_name.split( "/" )[ -1 ]
 os.environ[ "WANDB_CACHE_DIR" ] = wandb_cache_dir
 os.environ[ "WANDB_LOG_MODEL" ] = "checkpoint"
-n_examples = 1_000
+n_examples = 160_000
 full_batch_size = 16
 eval_and_logging_steps = 100
 save_steps = 500
@@ -74,6 +74,12 @@ default_params = {
 	"stt_init_id": "---",
 	"ett_init_id": "---",
 	"embedding_scale": 100.0,
+	"beta_thought": 1,
+	"beta_stability": 1,
+	"beta_mixer": 1,
+	"thought_temperature": 3,
+	"reinforce_temperature": 3,
+	#"look_ahead_pass": 1,
 }
 
 tokenizer_args = default_params.pop( "tokenizer_args", [ ] )
@@ -165,6 +171,7 @@ print( "Loaded datasets" )
 # }
 
 batch_size = full_batch_size // default_params[ "n_thoughts" ]
+#batch_size = 4
 global_gradient_accumulation_steps = full_batch_size // batch_size
 ts = int( time.time() )
 timestamp = datetime.fromtimestamp( ts )
