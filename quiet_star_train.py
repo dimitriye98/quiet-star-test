@@ -74,7 +74,6 @@ default_params = {
 	"stt_init_id": "---",
 	"ett_init_id": "---",
 	"embedding_scale": 100.0,
-	#"look_ahead_pass": 1,
 }
 
 tokenizer_args = default_params.pop( "tokenizer_args", [ ] )

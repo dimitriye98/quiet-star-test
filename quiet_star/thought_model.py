@@ -115,7 +115,6 @@ class ThoughtModelConfig( PretrainedConfig ):
 			stt_init_id: int = None,
 			ett_init_id: int = None,
 			look_ahead: int = 4,
-			look_ahead_pass: int = None,
 			n_thoughts: int = 2,
 			pad_token_id: int = None,
 			reinforce_temperature: float = 3.0,
@@ -136,7 +135,6 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.stt_init_id = stt_init_id
 		self.ett_init_id = ett_init_id
 		self.look_ahead = look_ahead
-		self.look_ahead_pass = look_ahead_pass
 		self.n_thoughts = n_thoughts
 		self.pad_token_id = pad_token_id
 		self.reinforce_temperature = reinforce_temperature
@@ -192,7 +190,6 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.beta_stability = config.beta_stability
 		self.beta_thought = config.beta_thought
 		self.look_ahead = config.look_ahead
-		self.look_ahead_pass = config.look_ahead_pass
 		self.mixer_config = config.mixer_config
 		self.n_thoughts = config.n_thoughts
 		self.reinforce_temperature = config.reinforce_temperature
@@ -382,41 +379,18 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		ts = t.cat( (ts, targets[ :, :, :-1, : ]), dim = -2 )
 
 		# Logits with thought
-		if self.look_ahead_pass is not None:
-			if self.look_ahead_pass != 1:
-				raise NotImplementedError
-			post_logits, post_hidden_states = None, None
-			for i in range( 0, self.look_ahead ):
-				slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
-				log, hidden = self.broadcast_logits(
-					ts[ :, :, layers_cached: layer_to_gen, : ],
-					kv_cache,
-					layers_cached,
-					layer_to_gen,
-					slice_mask,
-					keep = 1 )
-				if i == 0:
-					post_logits = log
-					post_hidden_states = hidden
-				else:
-					post_logits = t.cat( (post_logits, log), dim = -3 )
-					post_hidden_states = t.cat( (post_hidden_states, hidden), dim = -3 )
-
-				layers_cached = layer_to_gen
-				layer_to_gen += 1
-		else:
-			layer_to_gen += self.look_ahead - 1  # -1 because targets have one fewer layer for teacher forcing shift
-			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
-			post_logits, post_hidden_states = self.broadcast_logits(
-				ts[ :, :, layers_cached: layer_to_gen, : ],
-				kv_cache,
-				layers_cached,
-				layer_to_gen,
-				slice_mask,
-				keep = self.look_ahead )
-			# We won't use this anymore, but update it as a matter of hygiene
-			layers_cached = layer_to_gen
-			layer_to_gen += 1
+		layer_to_gen += self.look_ahead - 1  # -1 because targets have one fewer layer for teacher forcing shift
+		slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
+		post_logits, post_hidden_states = self.broadcast_logits(
+			ts[ :, :, layers_cached: layer_to_gen, : ],
+			kv_cache,
+			layers_cached,
+			layer_to_gen,
+			slice_mask,
+			keep = self.look_ahead )
+		# We won't use this anymore, but update it as a matter of hygiene
+		layers_cached = layer_to_gen
+		layer_to_gen += 1
 
 		# Logits without thought
 		prior_logits, prior_hidden_states = self.naive_forward(
