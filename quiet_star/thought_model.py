@@ -106,8 +106,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 	def __init__(
 			self,
 			*,
-			beta_mixer: float = 1.0,
-			beta_posterior: float = 1.0,
+			beta_mixed: float = 1.0,
 			beta_stability: float = 1.0,
 			beta_thought: float = 1.0,
 			end_thought_token_id: int = None,
@@ -126,8 +125,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			text_config: dict | PretrainedConfig = None,
 			**kwargs ):
 
-		self.beta_mixer = beta_mixer
-		self.beta_posterior = beta_posterior
+		self.beta_mixed = beta_mixed
 		self.beta_stability = beta_stability
 		self.beta_thought = beta_thought
 		self.end_thought_token_id = end_thought_token_id
@@ -185,8 +183,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.end_thought_token_id = config.end_thought_token_id
 		self.pad_token_id = config.pad_token_id
 
-		self.beta_mixer = config.beta_mixer
-		self.beta_posterior = config.beta_posterior
+		self.beta_mixed = config.beta_mixed
 		self.beta_stability = config.beta_stability
 		self.beta_thought = config.beta_thought
 		self.look_ahead = config.look_ahead
@@ -403,7 +400,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		prior_hidden_states = x.rearrange( "b l e d -> b n d l e", prior_hidden_states, n = self.n_thoughts )
 
 		alpha = self.mixer_head( prior_hidden_states.expand_as( post_hidden_states ), post_hidden_states )
-		logits = alpha * post_logits.detach() + (1 - alpha) * prior_logits.detach()
+		logits = alpha * post_logits + (1 - alpha) * prior_logits
 
 		# Compute cross entropy loss
 		v = logits.shape[ -1 ]
@@ -427,16 +424,17 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# Pool loss per thought
 		prior_cross_entropy_loss = x.reduce( "b n [d] l", prior_cross_entropy_loss, op = t.nanmean )
 
-		# Compute posterior cross entropy loss
-		v = post_logits.shape[ -1 ]
-		post_cross_entropy_loss = t.nn.functional.cross_entropy(
-			post_logits.reshape( -1, v ), targets.reshape( -1 ),
-			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
-			reduction = "none" ).reshape_as( targets )
-		post_cross_entropy_loss = post_cross_entropy_loss.masked_fill(
-			x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
-		# Pool loss per thought
-		post_cross_entropy_loss = x.reduce( "b n [d] l", post_cross_entropy_loss, op = t.nanmean )
+		# Compute posterior cross entropy (for REINFORCE reward, not directly optimized)
+		with t.no_grad():
+			v = post_logits.shape[ -1 ]
+			post_cross_entropy_loss = t.nn.functional.cross_entropy(
+				post_logits.reshape( -1, v ), targets.reshape( -1 ),
+				ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
+				reduction = "none" ).reshape_as( targets )
+			post_cross_entropy_loss = post_cross_entropy_loss.masked_fill(
+				x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
+			# Pool loss per thought
+			post_cross_entropy_loss = x.reduce( "b n [d] l", post_cross_entropy_loss, op = t.nanmean )
 
 		# Compute REINFORCE loss
 		r = prior_cross_entropy_loss - post_cross_entropy_loss
@@ -471,7 +469,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# confidence_loss = confidence_loss.masked_fill( padding_mask[ ..., :-(2 * self.look_ahead - 1) ], t.nan )
 		# confidence_loss = x.reduce( "b n [d] l", confidence_loss, op = "nanmean" )
 
-		loss = self.beta_mixer * mixed_cross_entropy_loss + self.beta_posterior * post_cross_entropy_loss + self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss
+		loss = self.beta_mixed * mixed_cross_entropy_loss + self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss
 		loss = t.nanmean( loss )
 
 		stats = {

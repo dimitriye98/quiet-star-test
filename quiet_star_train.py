@@ -76,7 +76,7 @@ default_params = {
 	"embedding_scale": 100.0,
 	"beta_thought": 1,
 	"beta_stability": 1,
-	"beta_mixer": 1,
+	"beta_mixed": 1,
 	"thought_temperature": 3,
 	"reinforce_temperature": 3,
 	#"look_ahead_pass": 1,
