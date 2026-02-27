@@ -120,6 +120,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			reinforce_temperature: float = 3.0,
 			start_thought_token_id: int = None,
 			thought_depth: int = 12,
+			thought_entropy_gain: float = None,
 			thought_temperature: float = 1.0,
 
 			mixer_config: dict | MixerConfig = None,
@@ -140,6 +141,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.reinforce_temperature = reinforce_temperature
 		self.start_thought_token_id = start_thought_token_id
 		self.thought_depth = thought_depth
+		self.thought_entropy_gain = thought_entropy_gain
 		self.thought_temperature = thought_temperature
 
 		if text_config is None:
@@ -194,6 +196,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.n_thoughts = config.n_thoughts
 		self.reinforce_temperature = config.reinforce_temperature
 		self.thought_depth = config.thought_depth
+		self.thought_entropy_gain = config.thought_entropy_gain
+		self.thought_entropy_target = None
 		self.thought_temperature = config.thought_temperature
 
 		self.lm_model = lm_model if lm_model is not None else AutoModel.from_config( config.text_config )
@@ -341,6 +345,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# Generate thoughts
 		layers_cached, layer_to_gen = 0, 2
 		thought_logits = None
+		thought_entropy_accum = 0.0
 		for i in range( self.thought_depth ):
 			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
 
@@ -358,6 +363,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 			new_toks = self.sample_thoughts( new_logs, thought_temperature ).detach()
 
+			with t.no_grad():
+				probs = (new_logs / thought_temperature).softmax( dim = -1 )
+				thought_entropy_accum = thought_entropy_accum - (probs * probs.log()).sum( dim = -1 ).mean()
 
 			layers_cached = layer_to_gen
 			layer_to_gen += 1
@@ -496,8 +504,19 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			"advantage_avg": t.nanmean( advantage ).item(),
 			"advantage_min": nanmin( advantage ).item(),
 			"advantage_max": nanmax( advantage ).item(),
-			"loss": loss.item()
+			"loss": loss.item(),
+			"thought_entropy": (thought_entropy_accum / self.thought_depth).item(),
+			"thought_temperature": thought_temperature,
 		}
+
+		# P controller for thought temperature based on entropy
+		if self.thought_entropy_gain is not None:
+			mean_entropy = thought_entropy_accum / self.thought_depth
+			if self.thought_entropy_target is None:
+				self.thought_entropy_target = mean_entropy.item()
+			else:
+				error = mean_entropy.item() - self.thought_entropy_target
+				self.thought_temperature = max( 0.01, self.thought_temperature + self.thought_entropy_gain * error )
 
 		return loss, logits, stats
 
