@@ -336,7 +336,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		thought_mask = self.construct_thought_mask(
 			b = ts.shape[ 0 ],
 			n = ts.shape[ 1 ],
-			d = 3 + self.look_ahead + self.thought_depth,  # input (1), start tok (1), depth, end tok (1), look ahead
+			d = 2 + self.look_ahead + self.thought_depth,  # input (1), start tok (1), depth, end tok (1), look ahead (-1 for teacher forcing shift)
 			l = ts.shape[ 3 ],
 			padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = self.n_thoughts )[ ..., :-self.look_ahead ],
 			dtype = self.dtype )
@@ -378,14 +378,13 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		targets = labels.unfold( -1, self.look_ahead, 1 )[ :, 1: ].transpose( -1, -2 )
 		targets = x.rearrange( "b d l -> b n d l", targets, n = self.n_thoughts, d = self.look_ahead )
 
-		# Append the targets to the thoughts
-		ts = t.cat( (ts, targets), dim = -2 )
+		# Append the targets to the thoughts (minus one for teacher forcing shift)
+		ts = t.cat( (ts, targets[ :, :, :-1, : ]), dim = -2 )
 
 		# Logits with thought
 		if self.look_ahead_pass is not None:
 			if self.look_ahead_pass != 1:
 				raise NotImplementedError
-			layer_to_gen += 1
 			post_logits, post_hidden_states = None, None
 			for i in range( 0, self.look_ahead ):
 				slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
@@ -406,7 +405,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				layers_cached = layer_to_gen
 				layer_to_gen += 1
 		else:
-			layer_to_gen += self.look_ahead
+			layer_to_gen += self.look_ahead - 1  # -1 because targets have one fewer layer for teacher forcing shift
 			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
 			post_logits, post_hidden_states = self.broadcast_logits(
 				ts[ :, :, layers_cached: layer_to_gen, : ],
