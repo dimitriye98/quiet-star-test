@@ -155,6 +155,11 @@ gres: "gpu:1"
 time: "24:00:00"
 mem: "32G"
 cpus_per_task: 4
+
+# Optional bash commands to run before training (e.g. SSH tunnels, module loads).
+# setup: |
+#   ssh -fN -D 1080 proxy-host
+#   export HTTPS_PROXY=socks5://localhost:1080
 """
 
 
@@ -195,6 +200,7 @@ def submit_slurm( slurm_config_path, train_args ):
 	# Load slurm config and build Slurm object
 	with open( slurm_config_path ) as f:
 		slurm_params = yaml.safe_load( f )
+	setup_script = slurm_params.pop( "setup", None )
 	slurm = Slurm( **slurm_params )
 
 	# Copy training config into worktree if provided
@@ -217,6 +223,10 @@ def submit_slurm( slurm_config_path, train_args ):
 		f"trap 'git -C {shlex.quote( repo_root )} worktree remove"
 		f" {shlex.quote( worktree_path )} --force' EXIT"
 	)
+
+	# Run user-provided setup script (e.g. SSH tunnels, module loads)
+	if setup_script is not None:
+		slurm.add_cmd( setup_script )
 
 	# Submit
 	job_id = slurm.sbatch( train_cmd )
