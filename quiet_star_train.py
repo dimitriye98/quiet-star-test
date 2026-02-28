@@ -1,6 +1,7 @@
 import contextlib
 import copy
 import shlex
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -196,11 +197,16 @@ def submit_slurm( slurm_config_path, train_args ):
 		slurm_params = yaml.safe_load( f )
 	slurm = Slurm( **slurm_params )
 
+	# Copy training config into worktree if provided
+	if train_args.path is not None:
+		config_basename = os.path.basename( train_args.path )
+		shutil.copy2( train_args.path, os.path.join( worktree_path, config_basename ) )
+
 	# Build the train command
 	python = sys.executable
 	cmd_parts = [ python, os.path.join( worktree_path, "quiet_star_train.py" ), "train" ]
 	if train_args.path is not None:
-		cmd_parts.append( os.path.abspath( train_args.path ) )
+		cmd_parts.append( config_basename )
 	if train_args.resume is not None:
 		cmd_parts.extend( [ "--resume", train_args.resume ] )
 	train_cmd = " ".join( shlex.quote( p ) for p in cmd_parts )
