@@ -13,7 +13,7 @@ from torch import nn
 from torch.utils.data import Dataset, IterableDataset
 
 from quiet_star import ThoughtModelConfig
-from quiet_star.config import DEFAULT_CONFIG, resolve_torch_dtype
+from quiet_star.config import DEFAULT_CONFIG, resolve_torch_dtype, save_config, load_config
 
 torch.backends.cuda.matmul.allow_tf32 = True
 import random
@@ -24,96 +24,6 @@ from transformers import TrainingArguments, Trainer
 import os
 import time
 from quiet_star.eval_helpers import preprocess_function, compute_metrics
-
-config = copy.deepcopy( DEFAULT_CONFIG )
-
-torch.manual_seed( config["random_seed"] )
-random.seed( config["random_seed"] )
-
-os.environ[ "WANDB_PROJECT" ] = config["project_name"] + "-" + config["dataset"]["name"].split( "/" )[ -1 ]
-os.environ[ "WANDB_CACHE_DIR" ] = config["root_prefix"] + "cache/quietstar/wandb_cache"
-os.environ[ "WANDB_LOG_MODEL" ] = "checkpoint"
-
-tokenizer = AutoTokenizer.from_pretrained(
-	config["base_model"]["name"],
-	padding_side = config["base_model"]["tokenizer_padding_side"],
-)
-
-
-def model_init( p ):
-	params = copy.deepcopy( config["thought_model"] )
-	if p is not None:
-		params |= p
-
-	print( params )
-
-	dtype = resolve_torch_dtype( config["base_model"]["torch_dtype"] )
-
-	print( "Loading model" )
-
-	lm_model = AutoModelForCausalLM.from_pretrained(
-		config["base_model"]["name"],
-		torch_dtype = dtype,
-		device_map = config["base_model"]["device_map"],
-	)
-
-	print( "Loaded model" )
-	if tokenizer.pad_token_id is None:
-		tokenizer.pad_token_id = tokenizer.eos_token_id
-
-	params[ "pad_token_id" ] = tokenizer.pad_token_id
-
-	special_tokens_to_add = [ "<thought>", "</thought>" ]
-	tokenizer.add_special_tokens( { "additional_special_tokens": special_tokens_to_add } )
-	lm_model.resize_token_embeddings( len( tokenizer ) )
-
-	stt_init_id = params.pop( "stt_init_id", None )
-	ett_init_id = params.pop( "ett_init_id", None )
-
-	params["stt_init_id"] = tokenizer.convert_tokens_to_ids( stt_init_id )
-	params["ett_init_id"] = tokenizer.convert_tokens_to_ids( ett_init_id )
-
-	params[ "start_thought_token_id" ] = tokenizer.convert_tokens_to_ids( "<thought>" )
-	params[ "end_thought_token_id" ] = tokenizer.convert_tokens_to_ids( "</thought>" )
-	params[ "text_config" ] = lm_model.config
-
-	model_config = ThoughtModelConfig( **params )
-	model = AutoModel.from_config( model_config, lm_model = lm_model )
-
-	model.train()
-	return model
-
-
-# Load dataset
-print( "Loading datasets" )
-ds_cfg = config["dataset"]
-dataset = load_dataset(
-	ds_cfg["name"],
-	"en" if "c4" in ds_cfg["name"] else "default",
-	split = f"train[:{ds_cfg['n_examples']}]",
-	num_proc = 1,
-)
-
-train_dataset = dataset.shuffle( seed = config["random_seed"] ).map(
-	partial( preprocess_function, max_length = ds_cfg["train_snippet_length"] ), batched = True, writer_batch_size = 200 )
-print( "Loaded datasets" )
-
-tr = copy.deepcopy( config["training"] )
-
-# Pop custom keys that aren't TrainingArguments fields
-effective_batch_size = tr.pop( "effective_batch_size" )
-eval_lm_batch_size = tr.pop( "eval_lm_batch_size" )
-
-# Compute derived TrainingArguments fields
-ts = int( time.time() )
-timestamp = datetime.fromtimestamp( ts )
-tr["output_dir"] = config["root_prefix"] + f"cache/quietstar/{ts}"
-tr["optim"] = "adamw_torch_fused" if torch.cuda.is_available() or torch.backends.mps.is_available() else "adamw_torch"
-tr["gradient_accumulation_steps"] = effective_batch_size // tr["per_device_train_batch_size"]
-tr["per_device_eval_batch_size"] = tr["per_device_train_batch_size"]
-tr["run_name"] = f"n{config['thought_model']['n_thoughts']}_d{config['thought_model']['thought_depth']}_la{config['thought_model']['look_ahead']}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}"
-
-training_args = TrainingArguments( **tr )
 
 
 @contextlib.contextmanager
@@ -203,14 +113,123 @@ class TrainerWithCache( Trainer ):
 		return (loss, o) if return_outputs else loss
 
 
-trainer = TrainerWithCache(
-	args = training_args,
-	train_dataset = train_dataset,
-	eval_dataset = [ "commonsense_qa" ],
-	compute_metrics = compute_metrics,
-	model_init = model_init,
-	processing_class = tokenizer,
-	eval_lm_batch_size = eval_lm_batch_size,
-)
+def train(config):
+	torch.manual_seed( config["random_seed"] )
+	random.seed( config["random_seed"] )
 
-trainer.train()
+	os.environ[ "WANDB_PROJECT" ] = config["project_name"] + "-" + config["dataset"]["name"].split( "/" )[ -1 ]
+	os.environ[ "WANDB_CACHE_DIR" ] = config["root_prefix"] + "cache/quietstar/wandb_cache"
+	os.environ[ "WANDB_LOG_MODEL" ] = "checkpoint"
+
+	tokenizer = AutoTokenizer.from_pretrained(
+		config["base_model"]["name"],
+		padding_side = config["base_model"]["tokenizer_padding_side"],
+	)
+
+	def model_init( p ):
+		params = copy.deepcopy( config["thought_model"] )
+		if p is not None:
+			params |= p
+
+		print( params )
+
+		dtype = resolve_torch_dtype( config["base_model"]["torch_dtype"] )
+
+		print( "Loading model" )
+
+		lm_model = AutoModelForCausalLM.from_pretrained(
+			config["base_model"]["name"],
+			torch_dtype = dtype,
+			device_map = config["base_model"]["device_map"],
+		)
+
+		print( "Loaded model" )
+		if tokenizer.pad_token_id is None:
+			tokenizer.pad_token_id = tokenizer.eos_token_id
+
+		params[ "pad_token_id" ] = tokenizer.pad_token_id
+
+		special_tokens_to_add = [ "<thought>", "</thought>" ]
+		tokenizer.add_special_tokens( { "additional_special_tokens": special_tokens_to_add } )
+		lm_model.resize_token_embeddings( len( tokenizer ) )
+
+		stt_init_id = params.pop( "stt_init_id", None )
+		ett_init_id = params.pop( "ett_init_id", None )
+
+		params["stt_init_id"] = tokenizer.convert_tokens_to_ids( stt_init_id )
+		params["ett_init_id"] = tokenizer.convert_tokens_to_ids( ett_init_id )
+
+		params[ "start_thought_token_id" ] = tokenizer.convert_tokens_to_ids( "<thought>" )
+		params[ "end_thought_token_id" ] = tokenizer.convert_tokens_to_ids( "</thought>" )
+		params[ "text_config" ] = lm_model.config
+
+		model_config = ThoughtModelConfig( **params )
+		model = AutoModel.from_config( model_config, lm_model = lm_model )
+
+		model.train()
+		return model
+
+	# Load dataset
+	print( "Loading datasets" )
+	ds_cfg = config["dataset"]
+	dataset = load_dataset(
+		ds_cfg["name"],
+		"en" if "c4" in ds_cfg["name"] else "default",
+		split = f"train[:{ds_cfg['n_examples']}]",
+		num_proc = 1,
+	)
+
+	train_dataset = dataset.shuffle( seed = config["random_seed"] ).map(
+		partial( preprocess_function, max_length = ds_cfg["train_snippet_length"] ), batched = True, writer_batch_size = 200 )
+	print( "Loaded datasets" )
+
+	tr = copy.deepcopy( config["training"] )
+
+	# Pop custom keys that aren't TrainingArguments fields
+	effective_batch_size = tr.pop( "effective_batch_size" )
+	eval_lm_batch_size = tr.pop( "eval_lm_batch_size" )
+
+	# Compute derived TrainingArguments fields
+	ts = int( time.time() )
+	timestamp = datetime.fromtimestamp( ts )
+	tr["output_dir"] = config["root_prefix"] + f"cache/quietstar/{ts}"
+	tr["optim"] = "adamw_torch_fused" if torch.cuda.is_available() or torch.backends.mps.is_available() else "adamw_torch"
+	tr["gradient_accumulation_steps"] = effective_batch_size // tr["per_device_train_batch_size"]
+	tr["per_device_eval_batch_size"] = tr["per_device_train_batch_size"]
+	tr["run_name"] = f"n{config['thought_model']['n_thoughts']}_d{config['thought_model']['thought_depth']}_la{config['thought_model']['look_ahead']}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}"
+
+	training_args = TrainingArguments( **tr )
+
+	trainer = TrainerWithCache(
+		args = training_args,
+		train_dataset = train_dataset,
+		eval_dataset = [ "commonsense_qa" ],
+		compute_metrics = compute_metrics,
+		model_init = model_init,
+		processing_class = tokenizer,
+		eval_lm_batch_size = eval_lm_batch_size,
+	)
+
+	trainer.train()
+
+
+if __name__ == "__main__":
+	import argparse
+
+	parser = argparse.ArgumentParser( description = "Quiet-Star training" )
+	subparsers = parser.add_subparsers( dest = "command", required = True )
+
+	init_parser = subparsers.add_parser( "init", help = "Create a default config file" )
+	init_parser.add_argument( "path", nargs = "?", default = "config.yaml", help = "Output path (default: config.yaml)" )
+
+	train_parser = subparsers.add_parser( "train", help = "Train from a config file" )
+	train_parser.add_argument( "path", nargs = "?", default = "config.yaml", help = "Config path (default: config.yaml)" )
+
+	args = parser.parse_args()
+
+	if args.command == "init":
+		save_config( DEFAULT_CONFIG, args.path )
+		print( f"Wrote default config to {args.path}" )
+	elif args.command == "train":
+		cfg = load_config( args.path )
+		train( cfg )

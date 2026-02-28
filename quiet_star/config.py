@@ -1,3 +1,4 @@
+import yaml
 import torch
 
 DEFAULT_CONFIG = {
@@ -73,3 +74,15 @@ def resolve_torch_dtype(s):
 	if s in mapping:
 		return mapping[s]
 	raise ValueError(f"Unknown torch dtype: {s!r}")
+
+
+def save_config(config, path):
+	"""Dump a config dict to a YAML file."""
+	with open(path, "w") as f:
+		yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+
+def load_config(path):
+	"""Load a config dict from a YAML file."""
+	with open(path, "r") as f:
+		return yaml.safe_load(f)
