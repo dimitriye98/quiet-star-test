@@ -113,7 +113,35 @@ class TrainerWithCache( Trainer ):
 		return (loss, o) if return_outputs else loss
 
 
-def train(config):
+class ConfigArtifactCallback( TrainerCallback ):
+	def __init__( self, config ):
+		self.config = config
+
+	def on_train_begin( self, args, state, control, **kwargs ):
+		import wandb
+		if wandb.run is None or not state.is_world_process_zero:
+			return
+		config_path = os.path.join( args.output_dir, "config.yaml" )
+		save_config( self.config, config_path )
+		artifact = wandb.Artifact( name = f"config-{wandb.run.name}", type = "config" )
+		artifact.add_file( config_path )
+		wandb.run.log_artifact( artifact )
+
+
+def config_from_wandb_checkpoint( checkpoint_ref ):
+	"""Download the config artifact from the run that produced a checkpoint."""
+	import wandb
+	api = wandb.Api()
+	checkpoint = api.artifact( checkpoint_ref )
+	run = checkpoint.logged_by()
+	for art in run.logged_artifacts():
+		if art.type == "config":
+			config_dir = art.download()
+			return load_config( os.path.join( config_dir, "config.yaml" ) )
+	raise ValueError( f"No config artifact found for run {run.name}" )
+
+
+def train(config, resume_from = None):
 	torch.manual_seed( config["random_seed"] )
 	random.seed( config["random_seed"] )
 
@@ -208,9 +236,17 @@ def train(config):
 		model_init = model_init,
 		processing_class = tokenizer,
 		eval_lm_batch_size = eval_lm_batch_size,
+		callbacks = [ ConfigArtifactCallback( config ) ],
 	)
 
-	trainer.train()
+	resume_checkpoint = None
+	if resume_from is not None:
+		import wandb
+		api = wandb.Api()
+		artifact = api.artifact( resume_from )
+		resume_checkpoint = artifact.download()
+
+	trainer.train( resume_from_checkpoint = resume_checkpoint )
 
 
 if __name__ == "__main__":
@@ -224,6 +260,8 @@ if __name__ == "__main__":
 
 	train_parser = subparsers.add_parser( "train", help = "Train from a config file" )
 	train_parser.add_argument( "path", nargs = "?", default = None, help = "Config path (uses built-in defaults if omitted)" )
+	train_parser.add_argument( "--resume", metavar = "ARTIFACT", default = None,
+		help = "W&B checkpoint artifact to resume from" )
 
 	args = parser.parse_args()
 
@@ -233,6 +271,8 @@ if __name__ == "__main__":
 	elif args.command == "train":
 		if args.path is not None:
 			cfg = load_config( args.path )
+		elif args.resume is not None:
+			cfg = config_from_wandb_checkpoint( args.resume )
 		else:
 			cfg = copy.deepcopy( DEFAULT_CONFIG )
-		train( cfg )
+		train( cfg, resume_from = args.resume )
