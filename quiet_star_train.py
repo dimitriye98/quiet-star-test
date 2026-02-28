@@ -40,7 +40,8 @@ os.environ[ "WANDB_PROJECT" ] = project_name + "-" + dataset_name.split( "/" )[ 
 os.environ[ "WANDB_CACHE_DIR" ] = wandb_cache_dir
 os.environ[ "WANDB_LOG_MODEL" ] = "checkpoint"
 n_examples = 160_000
-full_batch_size = 16
+effective_batch_size = 16
+batch_size = 4
 eval_and_logging_steps = 100
 save_steps = 500
 eval_batch_size = 512
@@ -170,9 +171,7 @@ print( "Loaded datasets" )
 # 	"csqa": eval_dataset_csqa,
 # }
 
-batch_size = full_batch_size // default_params[ "n_thoughts" ]
-#batch_size = 4
-global_gradient_accumulation_steps = full_batch_size // batch_size
+global_gradient_accumulation_steps = effective_batch_size // batch_size
 ts = int( time.time() )
 timestamp = datetime.fromtimestamp( ts )
 training_args = TrainingArguments(
