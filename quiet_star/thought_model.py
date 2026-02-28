@@ -194,7 +194,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.thought_temperature = config.thought_temperature
 
 		self.lm_model = lm_model if lm_model is not None else AutoModel.from_config( config.text_config )
-		self.mixer_head = WeightedMixerHead( config, lm_model.config.hidden_size )
+		self.mixer_head = WeightedMixerHead( config, lm_model.config.hidden_size ).to( dtype = self.lm_model.dtype )
 
 		embedding_scaling_mask = t.ones_like( self.lm_model.model.embed_tokens.weight )
 		embedding_scaling_mask[ self.start_thought_token_id ] *= config.embedding_scale
