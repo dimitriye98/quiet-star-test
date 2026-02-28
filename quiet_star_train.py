@@ -165,7 +165,7 @@ def submit_slurm( slurm_config_path, train_args ):
 
 	# Ensure working tree is clean
 	result = subprocess.run(
-		[ "git", "status", "--porcelain" ],
+		[ "git", "status", "--porcelain", "-uno" ],
 		capture_output = True, text = True, check = True
 	)
 	if result.stdout.strip():
