@@ -223,7 +223,7 @@ if __name__ == "__main__":
 	init_parser.add_argument( "path", nargs = "?", default = "config.yaml", help = "Output path (default: config.yaml)" )
 
 	train_parser = subparsers.add_parser( "train", help = "Train from a config file" )
-	train_parser.add_argument( "path", nargs = "?", default = "config.yaml", help = "Config path (default: config.yaml)" )
+	train_parser.add_argument( "path", nargs = "?", default = None, help = "Config path (uses built-in defaults if omitted)" )
 
 	args = parser.parse_args()
 
@@ -231,5 +231,8 @@ if __name__ == "__main__":
 		save_config( DEFAULT_CONFIG, args.path )
 		print( f"Wrote default config to {args.path}" )
 	elif args.command == "train":
-		cfg = load_config( args.path )
+		if args.path is not None:
+			cfg = load_config( args.path )
+		else:
+			cfg = copy.deepcopy( DEFAULT_CONFIG )
 		train( cfg )
