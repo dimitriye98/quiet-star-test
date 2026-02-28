@@ -1,5 +1,8 @@
 import contextlib
 import copy
+import shlex
+import subprocess
+import sys
 from datetime import datetime
 from typing import Optional, Union, Callable, Any
 from functools import partial
@@ -141,6 +144,81 @@ def config_from_wandb_checkpoint( checkpoint_ref ):
 	raise ValueError( f"No config artifact found for run {run.name}" )
 
 
+SLURM_TEMPLATE = """\
+# Slurm job configuration for quiet-star training.
+# Keys map directly to sbatch options (simple-slurm).
+# See: https://slurm.schedmd.com/sbatch.html
+
+partition: gpu
+gres: "gpu:1"
+time: "24:00:00"
+mem: "32G"
+cpus_per_task: 4
+"""
+
+
+def submit_slurm( slurm_config_path, train_args ):
+	"""Create a git worktree from HEAD and submit a Slurm job."""
+	import yaml
+	from simple_slurm import Slurm
+
+	# Ensure working tree is clean
+	result = subprocess.run(
+		[ "git", "status", "--porcelain" ],
+		capture_output = True, text = True, check = True
+	)
+	if result.stdout.strip():
+		print( "Error: uncommitted changes. Commit before submitting.", file = sys.stderr )
+		sys.exit( 1 )
+
+	# Create worktree from HEAD
+	repo_root = subprocess.run(
+		[ "git", "rev-parse", "--show-toplevel" ],
+		capture_output = True, text = True, check = True
+	).stdout.strip()
+
+	ts = int( time.time() )
+	worktree_path = os.path.join( repo_root, ".worktrees", f"job-{ts}" )
+	os.makedirs( os.path.dirname( worktree_path ), exist_ok = True )
+
+	head_commit = subprocess.run(
+		[ "git", "rev-parse", "HEAD" ],
+		capture_output = True, text = True, check = True
+	).stdout.strip()
+
+	subprocess.run(
+		[ "git", "worktree", "add", "--detach", worktree_path, head_commit ],
+		check = True
+	)
+
+	# Load slurm config and build Slurm object
+	with open( slurm_config_path ) as f:
+		slurm_params = yaml.safe_load( f )
+	slurm = Slurm( **slurm_params )
+
+	# Build the train command
+	python = sys.executable
+	cmd_parts = [ python, os.path.join( worktree_path, "quiet_star_train.py" ), "train" ]
+	if train_args.path is not None:
+		cmd_parts.append( os.path.abspath( train_args.path ) )
+	if train_args.resume is not None:
+		cmd_parts.extend( [ "--resume", train_args.resume ] )
+	train_cmd = " ".join( shlex.quote( p ) for p in cmd_parts )
+
+	# Setup: cd into worktree; cleanup worktree on exit
+	slurm.add_cmd( f"cd {shlex.quote( worktree_path )}" )
+	slurm.add_cmd(
+		f"trap 'git -C {shlex.quote( repo_root )} worktree remove"
+		f" {shlex.quote( worktree_path )} --force' EXIT"
+	)
+
+	# Submit
+	job_id = slurm.sbatch( train_cmd )
+	print( f"Submitted Slurm job {job_id}" )
+	print( f"Worktree: {worktree_path}" )
+	print( f"Commit: {head_commit[ :8 ]}" )
+
+
 def train(config, resume_from = None):
 	torch.manual_seed( config["random_seed"] )
 	random.seed( config["random_seed"] )
@@ -258,21 +336,33 @@ if __name__ == "__main__":
 	init_parser = subparsers.add_parser( "init", help = "Create a default config file" )
 	init_parser.add_argument( "path", nargs = "?", default = "config.yaml", help = "Output path (default: config.yaml)" )
 
+	init_slurm_parser = subparsers.add_parser( "init-slurm", help = "Create a template Slurm config file" )
+	init_slurm_parser.add_argument( "path", nargs = "?", default = "slurm.yaml", help = "Output path (default: slurm.yaml)" )
+
 	train_parser = subparsers.add_parser( "train", help = "Train from a config file" )
 	train_parser.add_argument( "path", nargs = "?", default = None, help = "Config path (uses built-in defaults if omitted)" )
 	train_parser.add_argument( "--resume", metavar = "ARTIFACT", default = None,
 		help = "W&B checkpoint artifact to resume from" )
+	train_parser.add_argument( "--slurm", metavar = "SLURM_CONFIG", default = None,
+		help = "Submit to Slurm using this config file instead of running locally" )
 
 	args = parser.parse_args()
 
 	if args.command == "init":
 		save_config( DEFAULT_CONFIG, args.path )
 		print( f"Wrote default config to {args.path}" )
+	elif args.command == "init-slurm":
+		with open( args.path, "w" ) as f:
+			f.write( SLURM_TEMPLATE )
+		print( f"Wrote Slurm template to {args.path}" )
 	elif args.command == "train":
-		if args.path is not None:
-			cfg = load_config( args.path )
-		elif args.resume is not None:
-			cfg = config_from_wandb_checkpoint( args.resume )
+		if args.slurm is not None:
+			submit_slurm( args.slurm, args )
 		else:
-			cfg = copy.deepcopy( DEFAULT_CONFIG )
-		train( cfg, resume_from = args.resume )
+			if args.path is not None:
+				cfg = load_config( args.path )
+			elif args.resume is not None:
+				cfg = config_from_wandb_checkpoint( args.resume )
+			else:
+				cfg = copy.deepcopy( DEFAULT_CONFIG )
+			train( cfg, resume_from = args.resume )
