@@ -9,11 +9,11 @@ import transformers
 from lm_eval import simple_evaluate
 from lm_eval.models.huggingface import HFLM
 from lm_eval.tasks import TaskManager
-from peft import PeftConfig, get_peft_model, LoraConfig
 from torch import nn
 from torch.utils.data import Dataset, IterableDataset
 
 from quiet_star import ThoughtModelConfig
+from quiet_star.config import DEFAULT_CONFIG, resolve_torch_dtype
 
 torch.backends.cuda.matmul.allow_tf32 = True
 import random
@@ -25,91 +25,39 @@ import os
 import time
 from quiet_star.eval_helpers import preprocess_function, compute_metrics
 
-random_seed = 42
-torch.manual_seed( random_seed )
-random.seed( random_seed )
+config = copy.deepcopy( DEFAULT_CONFIG )
 
-# MAIN SETUP
-root_prefix = "."
-wandb_cache_dir = root_prefix + "cache/quietstar/wandb_cache"
-dataset_name = 'open-web-math/open-web-math'
-train_snippet_length = 96
-# dataset_name = 'c4'
-project_name = "quiet-star"
-os.environ[ "WANDB_PROJECT" ] = project_name + "-" + dataset_name.split( "/" )[ -1 ]
-os.environ[ "WANDB_CACHE_DIR" ] = wandb_cache_dir
+torch.manual_seed( config["random_seed"] )
+random.seed( config["random_seed"] )
+
+os.environ[ "WANDB_PROJECT" ] = config["project_name"] + "-" + config["dataset"]["name"].split( "/" )[ -1 ]
+os.environ[ "WANDB_CACHE_DIR" ] = config["root_prefix"] + "cache/quietstar/wandb_cache"
 os.environ[ "WANDB_LOG_MODEL" ] = "checkpoint"
-n_examples = 160_000
-effective_batch_size = 16
-batch_size = 4
-eval_and_logging_steps = 100
-save_steps = 500
-eval_batch_size = 512
 
-default_params = {
-	# "base_model": "mistralai/Mistral-7B-v0.1",
-	"base_model": "Qwen/Qwen2.5-0.5B",
-	"torch_dtype": torch.bfloat16 if torch.cuda.is_available() or torch.backends.mps.is_available() else torch.float32,
-	"base_model_kwargs": {
-		"torch_dtype": torch.bfloat16 if torch.cuda.is_available() or torch.backends.mps.is_available() else torch.float32,
-		"device_map": "auto",
-		# "cache_dir": root_prefix + "cache",
-	},
-	"tokenizer_kwargs": {
-		"padding_side": "left",
-	},
-#	"peft_config": LoraConfig(
-#		r = 32,
-#		lora_alpha = 64,
-#		lora_dropout = 0.1,
-#		use_rslora = True,
-#		target_modules = "all-linear",
-#		exclude_modules = ".*(mixer_head|lm_head).*",
-#		trainable_token_indices = [], # Empty list is signal value for ["<thought>", "</thought>"]
-#		# modules_to_save = [m for m, _ in test_model.named_modules() if "mixer_head.mlp." in m],
-#		modules_to_save = [ "mixer_head" ],
-#	),
-	"n_thoughts": 2,
-	"thought_depth": 8,
-	"look_ahead": 4,
-	"stt_init_id": "---",
-	"ett_init_id": "---",
-	"embedding_scale": 100.0,
-	"beta_thought": 1,
-	"beta_stability": 1,
-	"beta_mixed": 1,
-	"thought_temperature": 3,
-	"reinforce_temperature": 3,
-	#"look_ahead_pass": 1,
-}
-
-tokenizer_args = default_params.pop( "tokenizer_args", [ ] )
-tokenizer_kwargs = default_params.pop( "tokenizer_kwargs", { } )
-tokenizer = AutoTokenizer.from_pretrained( default_params[ "base_model" ], *tokenizer_args, **tokenizer_kwargs )
+tokenizer = AutoTokenizer.from_pretrained(
+	config["base_model"]["name"],
+	padding_side = config["base_model"]["tokenizer_padding_side"],
+)
 
 
 def model_init( p ):
-	original = False
-	params = copy.deepcopy( default_params )
+	params = copy.deepcopy( config["thought_model"] )
 	if p is not None:
 		params |= p
 
 	print( params )
-	base_model = params.pop( "base_model" )
-	base_model_args = params.pop( "base_model_args", [ ] )
-	base_model_kwargs = params.pop( "base_model_kwargs", { } )
-	peft_config = params.pop( "peft_config", None )
+
+	dtype = resolve_torch_dtype( config["base_model"]["torch_dtype"] )
 
 	print( "Loading model" )
 
 	lm_model = AutoModelForCausalLM.from_pretrained(
-		base_model,
-		*base_model_args,
-		**base_model_kwargs
+		config["base_model"]["name"],
+		torch_dtype = dtype,
+		device_map = config["base_model"]["device_map"],
 	)
 
 	print( "Loaded model" )
-	# tokenizer.pad_token_id = tokenizer.eos_token_id
 	if tokenizer.pad_token_id is None:
 		tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -125,7 +73,6 @@ def model_init( p ):
 	params["stt_init_id"] = tokenizer.convert_tokens_to_ids( stt_init_id )
 	params["ett_init_id"] = tokenizer.convert_tokens_to_ids( ett_init_id )
 
-
 	params[ "start_thought_token_id" ] = tokenizer.convert_tokens_to_ids( "<thought>" )
 	params[ "end_thought_token_id" ] = tokenizer.convert_tokens_to_ids( "</thought>" )
 	params[ "text_config" ] = lm_model.config
@@ -133,71 +80,40 @@ def model_init( p ):
 	model_config = ThoughtModelConfig( **params )
 	model = AutoModel.from_config( model_config, lm_model = lm_model )
 
-	if peft_config is not None:
-		if isinstance( peft_config, dict ):
-			peft_config = PeftConfig.from_peft_type( **peft_config )
-
-		# Empty list is magic value
-		if hasattr( peft_config, "trainable_token_indices" ) and isinstance(
-				peft_config.trainable_token_indices, list ) and not peft_config.trainable_token_indices:
-			peft_config.trainable_token_indices = [ params[ "start_thought_token_id" ],
-				params[ "end_thought_token_id" ] ]
-
-		model = get_peft_model( model, peft_config )
-
 	model.train()
 	return model
 
 
 # Load dataset
 print( "Loading datasets" )
+ds_cfg = config["dataset"]
 dataset = load_dataset(
-	dataset_name,
-	"en" if "c4" in dataset_name else "default",
-	split = f"train[:{n_examples}]",
-	# ignore_verifications=True,
+	ds_cfg["name"],
+	"en" if "c4" in ds_cfg["name"] else "default",
+	split = f"train[:{ds_cfg['n_examples']}]",
 	num_proc = 1,
-	# cache_dir=root_prefix + "cache/datasets/",
 )
 
-train_dataset = dataset.shuffle( seed = random_seed ).map(
-	partial(preprocess_function, max_length=train_snippet_length), batched = True, writer_batch_size = 200 )
-# eval_dataset_gsm = load_dataset("gsm8k", "main", split="test").map(preprocess_eval_function_gsm, batched=True, writer_batch_size=200)
-# eval_dataset_csqa = load_dataset("tau/commonsense_qa", "default", split="validation").map(preprocess_eval_function_csqa, batched=True, writer_batch_size=200)
+train_dataset = dataset.shuffle( seed = config["random_seed"] ).map(
+	partial( preprocess_function, max_length = ds_cfg["train_snippet_length"] ), batched = True, writer_batch_size = 200 )
 print( "Loaded datasets" )
 
-# eval_datasets = {
-# 	"gsm8k": eval_dataset_gsm,
-# 	"csqa": eval_dataset_csqa,
-# }
+tr = copy.deepcopy( config["training"] )
 
-global_gradient_accumulation_steps = effective_batch_size // batch_size
+# Pop custom keys that aren't TrainingArguments fields
+effective_batch_size = tr.pop( "effective_batch_size" )
+eval_lm_batch_size = tr.pop( "eval_lm_batch_size" )
+
+# Compute derived TrainingArguments fields
 ts = int( time.time() )
 timestamp = datetime.fromtimestamp( ts )
-training_args = TrainingArguments(
-	output_dir = root_prefix + f"cache/quietstar/{ts}",
-	report_to = "wandb",
-	learning_rate = 2e-6,
-	optim = "adamw_torch_fused" if torch.cuda.is_available() or torch.backends.mps.is_available() else "adamw_torch",
-	per_device_train_batch_size = batch_size,
-	per_device_eval_batch_size = batch_size,
-	gradient_accumulation_steps = global_gradient_accumulation_steps,
-	max_grad_norm = 1.0,
-	max_steps = 100000,
-	warmup_steps = 20,
-	auto_find_batch_size = True,
-	weight_decay = 0.001,
-	label_names = [ "labels" ],
-	include_inputs_for_metrics = True,
-	log_level = "warning",
-	logging_steps = eval_and_logging_steps,
-	eval_on_start = True,
-	eval_steps = eval_and_logging_steps,
-	eval_strategy = "steps",
-	save_steps = save_steps,
-	run_name = f"n{ default_params[ 'n_thoughts' ] }_d{default_params[ 'thought_depth' ]}_la{default_params[ 'look_ahead' ]}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}",
-	# use_mps_device = True,
-)
+tr["output_dir"] = config["root_prefix"] + f"cache/quietstar/{ts}"
+tr["optim"] = "adamw_torch_fused" if torch.cuda.is_available() or torch.backends.mps.is_available() else "adamw_torch"
+tr["gradient_accumulation_steps"] = effective_batch_size // tr["per_device_train_batch_size"]
+tr["per_device_eval_batch_size"] = tr["per_device_train_batch_size"]
+tr["run_name"] = f"n{config['thought_model']['n_thoughts']}_d{config['thought_model']['thought_depth']}_la{config['thought_model']['look_ahead']}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}"
+
+training_args = TrainingArguments( **tr )
 
 
 @contextlib.contextmanager
@@ -244,12 +160,14 @@ class TrainerWithCache( Trainer ):
 					None, None),
 			optimizer_cls_and_kwargs: Optional[ tuple[ type[ torch.optim.Optimizer ], dict[ str, Any ] ] ] = None,
 			preprocess_logits_for_metrics: Optional[
-				Callable[ [ torch.Tensor, torch.Tensor ], torch.Tensor ] ] = None ):
+				Callable[ [ torch.Tensor, torch.Tensor ], torch.Tensor ] ] = None,
+			eval_lm_batch_size: int = 512 ):
 		super().__init__(
 			model, args, data_collator, train_dataset, eval_dataset, processing_class, model_init, compute_loss_func,
 			compute_metrics, callbacks, optimizers, optimizer_cls_and_kwargs, preprocess_logits_for_metrics )
 
 		self.task_manager = TaskManager()
+		self.eval_lm_batch_size = eval_lm_batch_size
 
 	def evaluate(
 			self,
@@ -261,7 +179,8 @@ class TrainerWithCache( Trainer ):
 		eval_dataset = eval_dataset if override else self.eval_dataset
 
 		hflm = HFLMThought(
-			self.model, backend = "causal", batch_size = 512, max_batch_size = 512, tokenizer = self.processing_class )
+			self.model, backend = "causal", batch_size = self.eval_lm_batch_size,
+			max_batch_size = self.eval_lm_batch_size, tokenizer = self.processing_class )
 
 		results = simple_evaluate(
 			model = hflm,
@@ -287,10 +206,11 @@ class TrainerWithCache( Trainer ):
 trainer = TrainerWithCache(
 	args = training_args,
 	train_dataset = train_dataset,
-	eval_dataset = [ "commonsense_qa" ],  # "gsm8k"],
+	eval_dataset = [ "commonsense_qa" ],
 	compute_metrics = compute_metrics,
 	model_init = model_init,
 	processing_class = tokenizer,
+	eval_lm_batch_size = eval_lm_batch_size,
 )
 
 trainer.train()
