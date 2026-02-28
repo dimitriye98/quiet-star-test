@@ -2,6 +2,7 @@ import contextlib
 import copy
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime
@@ -235,7 +236,32 @@ def submit_slurm( slurm_config_path, train_args ):
 	print( f"Commit: {head_commit[ :8 ]}" )
 
 
+_interrupted = False
+
+
+def _graceful_exit_handler( signum, frame ):
+	"""On first interrupt, set flag and switch to default handler so second interrupt force-quits."""
+	global _interrupted
+	signal.signal( signal.SIGINT, signal.SIG_DFL )
+	signal.signal( signal.SIGTERM, signal.SIG_DFL )
+	_interrupted = True
+	name = signal.Signals( signum ).name
+	print( f"\n{name} received. Will stop after current step...", file = sys.stderr )
+	print( "(Press Ctrl+C again to force quit)", file = sys.stderr )
+
+
+class GracefulStopCallback( TrainerCallback ):
+	def on_step_end( self, args, state, control, **kwargs ):
+		if _interrupted:
+			print( "Stopping training gracefully...", file = sys.stderr )
+			control.should_training_stop = True
+		return control
+
+
 def train(config, resume_from = None):
+	signal.signal( signal.SIGINT, _graceful_exit_handler )
+	signal.signal( signal.SIGTERM, _graceful_exit_handler )
+
 	torch.manual_seed( config["random_seed"] )
 	random.seed( config["random_seed"] )
 
@@ -330,7 +356,7 @@ def train(config, resume_from = None):
 		model_init = model_init,
 		processing_class = tokenizer,
 		eval_lm_batch_size = eval_lm_batch_size,
-		callbacks = [ ConfigArtifactCallback( config ) ],
+		callbacks = [ ConfigArtifactCallback( config ), GracefulStopCallback() ],
 	)
 
 	resume_checkpoint = None
