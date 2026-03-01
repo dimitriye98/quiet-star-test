@@ -207,8 +207,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 	def post_init(self):
 		super().post_init()
 
-
 		with t.no_grad():
+			# Zero-init mixer last layer so alpha starts near 0 (sigmoid(-5) ≈ 0.007)
+			last_layer = self.mixer_head.mlp[ -1 ]
+			last_layer.weight.zero_()
+			last_layer.bias.fill_( -5.0 )
+
 			if self.config.stt_init_id is not None:
 				self.lm_model.model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.model.embed_tokens.weight[ self.config.stt_init_id ]
 			if self.config.ett_init_id is not None:
