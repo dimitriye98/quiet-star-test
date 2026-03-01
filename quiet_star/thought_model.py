@@ -111,6 +111,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			beta_thought: float = 1.0,
 			end_thought_token_id: int = None,
 			embedding_scale: float = 1.0,
+			gated_reinforce: bool = False,
 			stt_init_id: int = None,
 			ett_init_id: int = None,
 			look_ahead: int = 4,
@@ -130,6 +131,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.beta_thought = beta_thought
 		self.end_thought_token_id = end_thought_token_id
 		self.embedding_scale = embedding_scale
+		self.gated_reinforce = gated_reinforce
 		self.stt_init_id = stt_init_id
 		self.ett_init_id = ett_init_id
 		self.look_ahead = look_ahead
@@ -186,6 +188,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.beta_mixed = config.beta_mixed
 		self.beta_stability = config.beta_stability
 		self.beta_thought = config.beta_thought
+		self.gated_reinforce = config.gated_reinforce
 		self.look_ahead = config.look_ahead
 		self.mixer_config = config.mixer_config
 		self.n_thoughts = config.n_thoughts
@@ -441,7 +444,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			post_cross_entropy_loss = x.reduce( "b n [d] l", post_cross_entropy_loss, op = t.nanmean )
 
 		# Compute REINFORCE loss
-		r = prior_cross_entropy_loss - post_cross_entropy_loss
+		reinforce_reward_loss = mixed_cross_entropy_loss if self.gated_reinforce else post_cross_entropy_loss
+		r = prior_cross_entropy_loss - reinforce_reward_loss
 		r_mean = x.mean( "b [n] l -> b 1 l", r )
 		advantage = t.nn.functional.relu( r - r_mean ).detach()
 
