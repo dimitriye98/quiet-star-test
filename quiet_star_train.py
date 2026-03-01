@@ -221,7 +221,8 @@ def submit_slurm( slurm_config_path, train_args ):
 	# Setup: cd into worktree; cleanup worktree on exit
 	slurm.add_cmd( f"cd {shlex.quote( worktree_path )}" )
 	slurm.add_cmd(
-		f"trap 'git -C {shlex.quote( repo_root )} worktree remove"
+		f"trap 'kill $(jobs -p) 2>/dev/null;"
+		f" git -C {shlex.quote( repo_root )} worktree remove"
 		f" {shlex.quote( worktree_path )} --force' EXIT"
 	)
 
