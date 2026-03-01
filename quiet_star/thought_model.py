@@ -199,10 +199,31 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.lm_model = lm_model if lm_model is not None else AutoModel.from_config( config.text_config )
 		self.mixer_head = WeightedMixerHead( config, lm_model.config.hidden_size ).to( dtype = self.lm_model.dtype )
 
-		embedding_scaling_mask = t.ones_like( self.lm_model.model.embed_tokens.weight )
-		embedding_scaling_mask[ self.start_thought_token_id ] *= config.embedding_scale
-		embedding_scaling_mask[ self.end_thought_token_id ] *= config.embedding_scale
-		self.lm_model.model.embed_tokens.weight.register_hook( lambda grad: grad * embedding_scaling_mask )
+		self.embedding_scale = config.embedding_scale
+		hidden_size = self.lm_model.config.hidden_size
+		self.start_embedding = t.nn.Parameter( t.zeros( hidden_size, dtype = self.lm_model.dtype ) )
+		self.end_embedding = t.nn.Parameter( t.zeros( hidden_size, dtype = self.lm_model.dtype ) )
+
+		def _embed_grad_hook( grad ):
+			grad = grad.clone()
+			start_grad = grad[ self.start_thought_token_id ] * self.embedding_scale
+			end_grad = grad[ self.end_thought_token_id ] * self.embedding_scale
+
+			if self.start_embedding.grad is not None:
+				self.start_embedding.grad.add_( start_grad )
+			else:
+				self.start_embedding.grad = start_grad.clone()
+
+			if self.end_embedding.grad is not None:
+				self.end_embedding.grad.add_( end_grad )
+			else:
+				self.end_embedding.grad = end_grad.clone()
+
+			grad[ self.start_thought_token_id ] = 0
+			grad[ self.end_thought_token_id ] = 0
+			return grad
+
+		self.lm_model.model.embed_tokens.weight.register_hook( _embed_grad_hook )
 
 		self.post_init()
 
@@ -217,10 +238,20 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			last_layer.bias.fill_( -5.0 )
 
 			if self.config.stt_init_id is not None:
-				self.lm_model.model.embed_tokens.weight[ self.start_thought_token_id ] = self.lm_model.model.embed_tokens.weight[ self.config.stt_init_id ]
+				self.start_embedding.copy_(
+					self.lm_model.model.embed_tokens.weight[ self.config.stt_init_id ] / self.embedding_scale )
 			if self.config.ett_init_id is not None:
-				self.lm_model.model.embed_tokens.weight[ self.end_thought_token_id ] = self.lm_model.model.embed_tokens.weight[ self.config.ett_init_id ]
+				self.end_embedding.copy_(
+					self.lm_model.model.embed_tokens.weight[ self.config.ett_init_id ] / self.embedding_scale )
 
+			self._sync_thought_embeddings()
+
+
+	def _sync_thought_embeddings( self ):
+		"""Write scaled thought embeddings into the embedding table."""
+		with t.no_grad():
+			self.lm_model.model.embed_tokens.weight[ self.start_thought_token_id ] = self.start_embedding * self.embedding_scale
+			self.lm_model.model.embed_tokens.weight[ self.end_thought_token_id ] = self.end_embedding * self.embedding_scale
 
 	@staticmethod
 	def construct_thought_mask( b, n, d, l, padding_mask, dtype ):
@@ -595,6 +626,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			thought_temperature = None,
 			thought_depth = None,
 	):
+		self._sync_thought_embeddings()
 		if thought_temperature is None:
 			thought_temperature = self.thought_temperature
 		if self.training:
