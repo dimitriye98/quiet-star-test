@@ -444,7 +444,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			post_cross_entropy_loss = x.reduce( "b n [d] l", post_cross_entropy_loss, op = t.nanmean )
 
 		# Compute REINFORCE loss
-		reinforce_reward_loss = mixed_cross_entropy_loss if self.gated_reinforce else post_cross_entropy_loss
+		reinforce_reward_loss = mixed_cross_entropy_loss.detach() if self.gated_reinforce else post_cross_entropy_loss
 		r = prior_cross_entropy_loss - reinforce_reward_loss
 		r_mean = x.mean( "b [n] l -> b 1 l", r )
 		advantage = t.nn.functional.relu( r - r_mean ).detach()
