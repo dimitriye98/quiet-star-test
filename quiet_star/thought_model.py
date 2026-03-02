@@ -508,11 +508,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# Apply REINFORCE loss
 		thought_loss = thought_ce * advantage
 
-		# Compute thought entropy for logging
-		thought_log_probs = t.nn.functional.log_softmax( thought_logits / self.reinforce_temperature, dim = -1 )
-		thought_entropy = -(thought_log_probs.exp() * thought_log_probs).sum( dim = -1 )
-		thought_entropy = thought_entropy.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
-		thought_entropy = x.reduce( "b n [d] l", thought_entropy, op = t.nanmean )
+		# Compute thought entropy for logging (no grad — only used for stats)
+		with t.no_grad():
+			thought_log_probs = t.nn.functional.log_softmax( thought_logits / self.reinforce_temperature, dim = -1 )
+			thought_entropy = -(thought_log_probs.exp() * thought_log_probs).sum( dim = -1 )
+			thought_entropy = thought_entropy.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
+			thought_entropy = x.reduce( "b n [d] l", thought_entropy, op = t.nanmean )
 
 		# # Compute confidence loss
 		# conf_alpha = alpha[ ..., 1:, :-(self.look_ahead - 1), : ]
