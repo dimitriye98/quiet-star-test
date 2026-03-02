@@ -481,7 +481,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		post_cross_entropy_loss = x.reduce( "b n [d] l", post_cross_entropy_loss, op = t.nanmean )
 
 		# Alpha-gated posterior loss: base model learns from post-thought predictions scaled by mixer confidence
-		alpha_pooled = x.reduce( "b n [d] l a -> b n l", alpha, op = t.nanmean )
+		alpha_pooled = x.reduce( "b n [d] l 1 -> b n l", alpha, op = t.nanmean )
 		posterior_loss = alpha_pooled.detach() * post_cross_entropy_loss
 
 		# Compute thought cross-entropy (REINFORCE log-probabilities)
