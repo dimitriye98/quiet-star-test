@@ -111,7 +111,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			beta_thought: float = 1.0,
 			end_thought_token_id: int = None,
 			embedding_scale: float = 1.0,
-			beta_entropy: float = 0.0,
+			coef_entropy: float = 0.0,
 			beta_posterior: float = 1.0,
 			gated_reinforce: bool = False,
 			mixer_init_bias: float = -5.0,
@@ -134,7 +134,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.beta_thought = beta_thought
 		self.end_thought_token_id = end_thought_token_id
 		self.embedding_scale = embedding_scale
-		self.beta_entropy = beta_entropy
+		self.coef_entropy = coef_entropy
 		self.beta_posterior = beta_posterior
 		self.gated_reinforce = gated_reinforce
 		self.mixer_init_bias = mixer_init_bias
@@ -191,7 +191,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.end_thought_token_id = config.end_thought_token_id
 		self.pad_token_id = config.pad_token_id
 
-		self.beta_entropy = config.beta_entropy
+		self.coef_entropy = config.coef_entropy
 		self.beta_mixed = config.beta_mixed
 		self.beta_posterior = config.beta_posterior
 		self.beta_stability = config.beta_stability
@@ -484,24 +484,31 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		alpha_pooled = x.reduce( "b n [d] l a -> b n l", alpha, op = t.nanmean )
 		posterior_loss = alpha_pooled.detach() * post_cross_entropy_loss
 
-		# Compute REINFORCE loss
-		reinforce_reward_loss = mixed_cross_entropy_loss.detach() if self.gated_reinforce else post_cross_entropy_loss.detach()
-		r = prior_cross_entropy_loss - reinforce_reward_loss
-		r_mean = x.mean( "b [n] l -> b 1 l", r )
-		advantage = t.nn.functional.relu( r - r_mean ).detach()
-
-		# Apply REINFORCE loss
+		# Compute thought cross-entropy (REINFORCE log-probabilities)
 		thought_targets = ts[ ..., 2:2 + self.thought_depth, : ]
 		v = thought_logits.shape[ -1 ]
-		thought_loss = t.nn.functional.cross_entropy(
+		thought_ce = t.nn.functional.cross_entropy(
 			thought_logits.reshape( -1, v ) / self.reinforce_temperature, thought_targets.reshape( -1 ),
 			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
 			reduction = "none" ).reshape_as( thought_targets )
-		thought_loss = thought_loss.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
+		thought_ce = thought_ce.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
 		# Pool loss per thought
-		thought_loss = x.reduce( "b n [d] l", thought_loss, op = t.nanmean ) * advantage
+		thought_ce = x.reduce( "b n [d] l", thought_ce, op = t.nanmean )
 
-		# Compute thought entropy bonus (prevents policy collapse)
+		# Compute soft-reward advantage (max-entropy RL)
+		# Hard reward: how much thought improved prediction
+		reinforce_reward_loss = mixed_cross_entropy_loss.detach() if self.gated_reinforce else post_cross_entropy_loss.detach()
+		r = prior_cross_entropy_loss - reinforce_reward_loss
+		# Soft reward: augment with thought log-probability to encourage exploration
+		# thought_ce = -mean(log π(τ)), so adding it rewards higher-entropy thought sequences
+		r_soft = r + self.coef_entropy * thought_ce.detach()
+		r_soft_mean = x.mean( "b [n] l -> b 1 l", r_soft )
+		advantage = t.nn.functional.relu( r_soft - r_soft_mean ).detach()
+
+		# Apply REINFORCE loss
+		thought_loss = thought_ce * advantage
+
+		# Compute thought entropy for logging
 		thought_log_probs = t.nn.functional.log_softmax( thought_logits / self.reinforce_temperature, dim = -1 )
 		thought_entropy = -(thought_log_probs.exp() * thought_log_probs).sum( dim = -1 )
 		thought_entropy = thought_entropy.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
@@ -525,8 +532,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# confidence_loss = x.reduce( "b n [d] l", confidence_loss, op = "nanmean" )
 
 		loss = (self.beta_mixed * mixed_cross_entropy_loss + self.beta_posterior * posterior_loss
-			+ self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss
-			- self.beta_entropy * thought_entropy)
+			+ self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss)
 		loss = t.nanmean( loss )
 
 		stats = {
