@@ -25,7 +25,6 @@ DEFAULT_CONFIG = {
 		"beta_thought": 1.0,
 		"beta_stability": 1.0,
 		"beta_mixed": 1.0,
-		"beta_posterior": 1.0,
 		"coef_entropy": 0.0,
 		"mixer_init_bias": -5.0,
 	},
