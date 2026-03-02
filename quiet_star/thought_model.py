@@ -112,6 +112,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			end_thought_token_id: int = None,
 			embedding_scale: float = 1.0,
 			gated_reinforce: bool = False,
+			mixer_init_bias: float = -5.0,
 			stt_init_id: int = None,
 			ett_init_id: int = None,
 			look_ahead: int = 4,
@@ -132,6 +133,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.end_thought_token_id = end_thought_token_id
 		self.embedding_scale = embedding_scale
 		self.gated_reinforce = gated_reinforce
+		self.mixer_init_bias = mixer_init_bias
 		self.stt_init_id = stt_init_id
 		self.ett_init_id = ett_init_id
 		self.look_ahead = look_ahead
@@ -232,10 +234,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		super().post_init()
 
 		with t.no_grad():
-			# Zero-init mixer last layer so alpha starts near 0 (sigmoid(-5) ≈ 0.007)
 			last_layer = self.mixer_head.mlp[ -1 ]
 			last_layer.weight.zero_()
-			last_layer.bias.fill_( -5.0 )
+			last_layer.bias.fill_( self.config.mixer_init_bias )
 
 			if self.config.stt_init_id is not None:
 				self.start_embedding.copy_(
