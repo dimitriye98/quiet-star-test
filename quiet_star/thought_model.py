@@ -111,6 +111,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			beta_thought: float = 1.0,
 			end_thought_token_id: int = None,
 			embedding_scale: float = 1.0,
+			beta_entropy: float = 0.0,
 			gated_reinforce: bool = False,
 			mixer_init_bias: float = -5.0,
 			stt_init_id: int = None,
@@ -132,6 +133,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.beta_thought = beta_thought
 		self.end_thought_token_id = end_thought_token_id
 		self.embedding_scale = embedding_scale
+		self.beta_entropy = beta_entropy
 		self.gated_reinforce = gated_reinforce
 		self.mixer_init_bias = mixer_init_bias
 		self.stt_init_id = stt_init_id
@@ -187,6 +189,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.end_thought_token_id = config.end_thought_token_id
 		self.pad_token_id = config.pad_token_id
 
+		self.beta_entropy = config.beta_entropy
 		self.beta_mixed = config.beta_mixed
 		self.beta_stability = config.beta_stability
 		self.beta_thought = config.beta_thought
@@ -492,6 +495,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# Pool loss per thought
 		thought_loss = x.reduce( "b n [d] l", thought_loss, op = t.nanmean ) * advantage
 
+		# Compute thought entropy bonus (prevents policy collapse)
+		thought_log_probs = t.nn.functional.log_softmax( thought_logits / self.reinforce_temperature, dim = -1 )
+		thought_entropy = -(thought_log_probs.exp() * thought_log_probs).sum( dim = -1 )
+		thought_entropy = thought_entropy.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
+		thought_entropy = x.reduce( "b n [d] l", thought_entropy, op = t.nanmean )
+
 		# # Compute confidence loss
 		# conf_alpha = alpha[ ..., 1:, :-(self.look_ahead - 1), : ]
 		# confidence = self.confidence_head(
@@ -509,7 +518,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# confidence_loss = confidence_loss.masked_fill( padding_mask[ ..., :-(2 * self.look_ahead - 1) ], t.nan )
 		# confidence_loss = x.reduce( "b n [d] l", confidence_loss, op = "nanmean" )
 
-		loss = self.beta_mixed * mixed_cross_entropy_loss + self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss
+		loss = self.beta_mixed * mixed_cross_entropy_loss + self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss - self.beta_entropy * thought_entropy
 		loss = t.nanmean( loss )
 
 		stats = {
@@ -534,6 +543,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			"advantage_avg": t.nanmean( advantage ).item(),
 			"advantage_min": nanmin( advantage ).item(),
 			"advantage_max": nanmax( advantage ).item(),
+			"thought_entropy_avg": t.nanmean( thought_entropy ).item(),
+			"thought_entropy_min": nanmin( thought_entropy ).item(),
+			"thought_entropy_max": nanmax( thought_entropy ).item(),
 			"loss": loss.item()
 		}
 
