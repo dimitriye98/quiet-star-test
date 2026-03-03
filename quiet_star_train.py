@@ -113,7 +113,7 @@ def submit_slurm( slurm_config_path, train_args ):
 	script_args = " ".join( shlex.quote( p ) for p in script_parts )
 
 	train_cmd = (
-		f"srun --kill-on-bad-exit=1"
+		f"srun --export=ALL --kill-on-bad-exit=1"
 		f" {shlex.quote( python )} -m torch.distributed.run"
 		f" --nnodes=$SLURM_NNODES"
 		f" --nproc_per_node=1"
