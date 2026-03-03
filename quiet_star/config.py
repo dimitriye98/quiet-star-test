@@ -54,7 +54,7 @@ DEFAULT_CONFIG = {
 		"eval_strategy": "steps",
 		"eval_on_start": True,
 		"save_steps": 500,
-		"auto_find_batch_size": True,
+		"deepspeed": "ds_config.json",
 		"label_names": ["labels"],
 		"include_inputs_for_metrics": True,
 		"log_level": "warning",
