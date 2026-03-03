@@ -230,27 +230,6 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.start_embedding = t.nn.Parameter( t.zeros( hidden_size, dtype = self.lm_model.dtype ) )
 		self.end_embedding = t.nn.Parameter( t.zeros( hidden_size, dtype = self.lm_model.dtype ) )
 
-		def _embed_grad_hook( grad ):
-			grad = grad.clone()
-			start_grad = grad[ self.start_thought_token_id ] * self.embedding_scale
-			end_grad = grad[ self.end_thought_token_id ] * self.embedding_scale
-
-			if self.start_embedding.grad is not None:
-				self.start_embedding.grad.add_( start_grad )
-			else:
-				self.start_embedding.grad = start_grad.clone()
-
-			if self.end_embedding.grad is not None:
-				self.end_embedding.grad.add_( end_grad )
-			else:
-				self.end_embedding.grad = end_grad.clone()
-
-			grad[ self.start_thought_token_id ] = 0
-			grad[ self.end_thought_token_id ] = 0
-			return grad
-
-		self.lm_model.model.embed_tokens.weight.register_hook( _embed_grad_hook )
-
 		self.post_init()
 
 	@override
@@ -270,14 +249,23 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				self.end_embedding.copy_(
 					self.lm_model.model.embed_tokens.weight[ self.config.ett_init_id ] / self.embedding_scale )
 
-			self._sync_thought_embeddings()
+			self.sync_thought_embeddings()
 
 
-	def _sync_thought_embeddings( self ):
+	def sync_thought_embeddings( self ):
 		"""Write scaled thought embeddings into the embedding table."""
 		with t.no_grad():
 			self.lm_model.model.embed_tokens.weight[ self.start_thought_token_id ] = self.start_embedding * self.embedding_scale
 			self.lm_model.model.embed_tokens.weight[ self.end_thought_token_id ] = self.end_embedding * self.embedding_scale
+
+	def _embed( self, input_ids ):
+		"""Look up embeddings, differentiably replacing thought token positions."""
+		embeds = self.lm_model.model.embed_tokens( input_ids )
+		stt_mask = (input_ids == self.start_thought_token_id).unsqueeze( -1 )
+		ett_mask = (input_ids == self.end_thought_token_id).unsqueeze( -1 )
+		embeds = t.where( stt_mask, self.start_embedding * self.embedding_scale, embeds )
+		embeds = t.where( ett_mask, self.end_embedding * self.embedding_scale, embeds )
+		return embeds
 
 	@staticmethod
 	def construct_thought_mask( b, n, d, l, padding_mask, dtype ):
@@ -328,12 +316,13 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		a_mask = x.rearrange( "b n D L d l -> (b n) 1 (D L) (d l)", mask )
 		input_ids = x.rearrange( "b n d l -> (b n) (d l)", ts )
+		inputs_embeds = self._embed( input_ids )
 		position_ids = x.rearrange(
 			"d l -> (b n) (d l)", t.arange( l, device = ts.device ) + (t.arange( d, device = ts.device ) + layers_cached).unsqueeze( -1 ),
 			b = b, n = n )
 
 		out = self.lm_model(
-			input_ids = input_ids,
+			inputs_embeds = inputs_embeds,
 			position_ids = position_ids,
 			attention_mask = a_mask,
 			past_key_values = kv_cache,
@@ -356,8 +345,13 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		assert padding_mask.shape[ -1 ] == input_ids.shape[ -1 ] + (
 			kv_cache.get_seq_length() if kv_cache is not None else 0)
 
+		if self.training:
+			model_input = { "inputs_embeds": self._embed( input_ids ) }
+		else:
+			model_input = { "input_ids": input_ids }
+
 		out = self.lm_model(
-			input_ids = input_ids,
+			**model_input,
 			attention_mask = padding_mask,
 			past_key_values = kv_cache,
 			use_cache = kv_cache is not None,
@@ -726,7 +720,6 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			thought_temperature = None,
 			thought_depth = None,
 	):
-		self._sync_thought_embeddings()
 		if thought_temperature is None:
 			thought_temperature = self.thought_temperature
 		if self.training:

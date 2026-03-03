@@ -265,6 +265,14 @@ class GracefulStopCallback( TrainerCallback ):
 		return control
 
 
+class SyncEmbeddingsCallback( TrainerCallback ):
+	def on_step_end( self, args, state, control, model = None, **kwargs ):
+		if model is not None:
+			m = model.module if hasattr( model, "module" ) else model
+			m.sync_thought_embeddings()
+		return control
+
+
 def train(config, resume_from = None):
 	signal.signal( signal.SIGINT, _graceful_exit_handler )
 	signal.signal( signal.SIGTERM, _graceful_exit_handler )
@@ -363,7 +371,7 @@ def train(config, resume_from = None):
 		model_init = model_init,
 		processing_class = tokenizer,
 		eval_lm_batch_size = eval_lm_batch_size,
-		callbacks = [ ConfigArtifactCallback( config ), GracefulStopCallback() ],
+		callbacks = [ ConfigArtifactCallback( config ), GracefulStopCallback(), SyncEmbeddingsCallback() ],
 	)
 
 	resume_checkpoint = None
