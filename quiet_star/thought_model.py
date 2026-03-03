@@ -193,7 +193,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 	config_class = ThoughtModelConfig
 	_supports_cache_class = True
 	_supports_static_cache = True
-	_supports_gradient_checkpointing = True
+	supports_gradient_checkpointing = True
 	base_model_prefix = "lm_model"
 
 	# def _init_weights( self, module ):
