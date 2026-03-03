@@ -1,136 +1,15 @@
-import contextlib
 import copy
+import os
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime
-from typing import Optional, Union, Callable, Any
 from functools import partial
 
-import torch
-import transformers
-from lm_eval import simple_evaluate
-from lm_eval.models.huggingface import HFLM
-from lm_eval.tasks import TaskManager
-from torch import nn
-from torch.utils.data import Dataset, IterableDataset
-
-from quiet_star import ThoughtModelConfig
 from quiet_star.config import DEFAULT_CONFIG, resolve_torch_dtype, save_config, load_config
-
-torch.backends.cuda.matmul.allow_tf32 = True
-import random
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel, DynamicCache, PreTrainedModel, DataCollator, \
-	PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin, EvalPrediction, TrainerCallback
-from datasets import load_dataset
-from transformers import TrainingArguments, Trainer
-import os
-import time
-from quiet_star.eval_helpers import preprocess_function, compute_metrics
-
-
-@contextlib.contextmanager
-def cm_memory():
-	torch.cuda.memory._record_memory_history( max_entries = 100000, stacks = "python" )
-	try:
-		yield
-	finally:
-		torch.cuda.memory._dump_snapshot( "snapshot.pickle" )
-	torch.cuda.memory._record_memory_history( enabled = None )
-
-
-class HFLMThought( HFLM ):
-
-	def _model_call( self, inps, attn_mask = None, labels = None ):
-		assert self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
-		with torch.inference_mode():
-			# Greedy decoding for thoughts during evaluation
-			return self.model(inps, thought_temperature = 0.0 ).logits
-
-	def _select_cont_toks( self, logits: torch.Tensor, contlen: int = None, inplen: int = None ) -> torch.Tensor:
-		# The default implementation of HFLM assumes logits are emitted for
-		# the entire input sequence, and truncates them away.
-		# That's expensive and unnecessary for our model, but not
-		# conforming to it breaks the implementation. However, making this
-		# truncation function a no-op is a sufficient fix.
-		return logits
-
-
-class TrainerWithCache( Trainer ):
-
-	def __init__(
-			self, model: Union[ PreTrainedModel, nn.Module, None ] = None, args: TrainingArguments = None,
-			data_collator: Optional[ DataCollator ] = None,
-			train_dataset: Optional[ Union[ Dataset, IterableDataset, "datasets.Dataset" ] ] = None,
-			eval_dataset: Optional[ Union[ Dataset, dict[ str, Dataset ], "datasets.Dataset" ] ] = None,
-			processing_class: Optional[
-				Union[ PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin ]
-			] = None, model_init: Optional[ Callable[ [ ], PreTrainedModel ] ] = None,
-			compute_loss_func: Optional[ Callable ] = None,
-			compute_metrics: Optional[ Callable[ [ EvalPrediction ], dict ] ] = None,
-			callbacks: Optional[ list[ TrainerCallback ] ] = None,
-			optimizers: tuple[ Optional[ torch.optim.Optimizer ], Optional[ torch.optim.lr_scheduler.LambdaLR ] ] = (
-					None, None),
-			optimizer_cls_and_kwargs: Optional[ tuple[ type[ torch.optim.Optimizer ], dict[ str, Any ] ] ] = None,
-			preprocess_logits_for_metrics: Optional[
-				Callable[ [ torch.Tensor, torch.Tensor ], torch.Tensor ] ] = None,
-			eval_lm_batch_size: int = 512 ):
-		super().__init__(
-			model, args, data_collator, train_dataset, eval_dataset, processing_class, model_init, compute_loss_func,
-			compute_metrics, callbacks, optimizers, optimizer_cls_and_kwargs, preprocess_logits_for_metrics )
-
-		self.task_manager = TaskManager()
-		self.eval_lm_batch_size = eval_lm_batch_size
-
-	def evaluate(
-			self,
-			eval_dataset = None,
-			ignore_keys = None,
-			metric_key_prefix: str = "eval" ) -> dict[ str, float ]:
-		metric_key_prefix = "eval_"
-		override = eval_dataset is not None
-		eval_dataset = eval_dataset if override else self.eval_dataset
-
-		hflm = HFLMThought(
-			self.model, backend = "causal", batch_size = self.eval_lm_batch_size,
-			max_batch_size = self.eval_lm_batch_size, tokenizer = self.processing_class )
-
-		results = simple_evaluate(
-			model = hflm,
-			tasks = eval_dataset,
-			task_manager = self.task_manager,
-		)
-		results = { metric_key_prefix + k: v for k, v in results[ "results" ].items() }
-
-		self.log( results )
-
-		return results
-
-	def compute_loss( self, model, inputs, return_outputs = False, num_items_in_batch = None ):
-		inputs[ "past_key_values" ] = DynamicCache()
-
-		with cm_memory() if torch.cuda.is_available() else contextlib.nullcontext():
-			loss, o = super().compute_loss(
-				model, inputs, return_outputs = True, num_items_in_batch = num_items_in_batch )
-		self.log( o[ 2 ] )
-		return (loss, o) if return_outputs else loss
-
-
-class ConfigArtifactCallback( TrainerCallback ):
-	def __init__( self, config ):
-		self.config = config
-
-	def on_train_begin( self, args, state, control, **kwargs ):
-		import wandb
-		if wandb.run is None or not state.is_world_process_zero:
-			return
-		config_path = os.path.join( args.output_dir, "config.yaml" )
-		save_config( self.config, config_path )
-		artifact = wandb.Artifact( name = f"config-{wandb.run.name}", type = "config" )
-		artifact.add_file( config_path )
-		wandb.run.log_artifact( artifact )
 
 
 def config_from_wandb_checkpoint( checkpoint_ref ):
@@ -285,23 +164,120 @@ def _graceful_exit_handler( signum, frame ):
 	print( "(Press Ctrl+C again to force quit)", file = sys.stderr )
 
 
-class GracefulStopCallback( TrainerCallback ):
-	def on_step_end( self, args, state, control, **kwargs ):
-		if _interrupted:
-			print( "Stopping training gracefully...", file = sys.stderr )
-			control.should_training_stop = True
-		return control
-
-
-class SyncEmbeddingsCallback( TrainerCallback ):
-	def on_step_end( self, args, state, control, model = None, **kwargs ):
-		if model is not None:
-			m = model.module if hasattr( model, "module" ) else model
-			m.sync_thought_embeddings()
-		return control
-
-
 def train(config, resume_from = None):
+	import contextlib
+	import random
+
+	import torch
+	import transformers
+	from lm_eval import simple_evaluate
+	from lm_eval.models.huggingface import HFLM
+	from lm_eval.tasks import TaskManager
+	from torch import nn
+	from torch.utils.data import Dataset, IterableDataset
+
+	from quiet_star import ThoughtModelConfig
+	from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel, DynamicCache, PreTrainedModel, \
+		DataCollator, PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin, \
+		EvalPrediction, TrainerCallback, TrainingArguments, Trainer
+	from datasets import load_dataset
+	from quiet_star.eval_helpers import preprocess_function, compute_metrics
+
+	torch.backends.cuda.matmul.allow_tf32 = True
+
+	@contextlib.contextmanager
+	def cm_memory():
+		torch.cuda.memory._record_memory_history( max_entries = 100000, stacks = "python" )
+		try:
+			yield
+		finally:
+			torch.cuda.memory._dump_snapshot( "snapshot.pickle" )
+		torch.cuda.memory._record_memory_history( enabled = None )
+
+	class HFLMThought( HFLM ):
+
+		def _model_call( self, inps, attn_mask = None, labels = None ):
+			assert self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
+			with torch.inference_mode():
+				# Greedy decoding for thoughts during evaluation
+				return self.model(inps, thought_temperature = 0.0 ).logits
+
+		def _select_cont_toks( self, logits, contlen = None, inplen = None ):
+			# The default implementation of HFLM assumes logits are emitted for
+			# the entire input sequence, and truncates them away.
+			# That's expensive and unnecessary for our model, but not
+			# conforming to it breaks the implementation. However, making this
+			# truncation function a no-op is a sufficient fix.
+			return logits
+
+	class TrainerWithCache( Trainer ):
+
+		def __init__( self, *args, eval_lm_batch_size = 512, **kwargs ):
+			super().__init__( *args, **kwargs )
+			self.task_manager = TaskManager()
+			self.eval_lm_batch_size = eval_lm_batch_size
+
+		def evaluate(
+				self,
+				eval_dataset = None,
+				ignore_keys = None,
+				metric_key_prefix: str = "eval" ):
+			metric_key_prefix = "eval_"
+			override = eval_dataset is not None
+			eval_dataset = eval_dataset if override else self.eval_dataset
+
+			hflm = HFLMThought(
+				self.model, backend = "causal", batch_size = self.eval_lm_batch_size,
+				max_batch_size = self.eval_lm_batch_size, tokenizer = self.processing_class )
+
+			results = simple_evaluate(
+				model = hflm,
+				tasks = eval_dataset,
+				task_manager = self.task_manager,
+			)
+			results = { metric_key_prefix + k: v for k, v in results[ "results" ].items() }
+
+			self.log( results )
+
+			return results
+
+		def compute_loss( self, model, inputs, return_outputs = False, num_items_in_batch = None ):
+			inputs[ "past_key_values" ] = DynamicCache()
+
+			with cm_memory() if torch.cuda.is_available() else contextlib.nullcontext():
+				loss, o = super().compute_loss(
+					model, inputs, return_outputs = True, num_items_in_batch = num_items_in_batch )
+			self.log( o[ 2 ] )
+			return (loss, o) if return_outputs else loss
+
+	class ConfigArtifactCallback( TrainerCallback ):
+		def __init__( self, config ):
+			self.config = config
+
+		def on_train_begin( self, args, state, control, **kwargs ):
+			import wandb
+			if wandb.run is None or not state.is_world_process_zero:
+				return
+			config_path = os.path.join( args.output_dir, "config.yaml" )
+			save_config( self.config, config_path )
+			artifact = wandb.Artifact( name = f"config-{wandb.run.name}", type = "config" )
+			artifact.add_file( config_path )
+			wandb.run.log_artifact( artifact )
+
+	class GracefulStopCallback( TrainerCallback ):
+		def on_step_end( self, args, state, control, **kwargs ):
+			if _interrupted:
+				print( "Stopping training gracefully...", file = sys.stderr )
+				control.should_training_stop = True
+			return control
+
+	class SyncEmbeddingsCallback( TrainerCallback ):
+		def on_step_end( self, args, state, control, model = None, **kwargs ):
+			if model is not None:
+				m = model.module if hasattr( model, "module" ) else model
+				m.sync_thought_embeddings()
+			return control
+
 	signal.signal( signal.SIGINT, _graceful_exit_handler )
 	signal.signal( signal.SIGTERM, _graceful_exit_handler )
 
