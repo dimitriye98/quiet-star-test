@@ -153,6 +153,8 @@ SLURM_TEMPLATE = """\
 
 job_name: qstar
 partition: gpu
+nodes: 1
+ntasks_per_node: 1
 gres: "gpu:1"
 time: "24:00:00"
 mem: "32G"
@@ -211,14 +213,35 @@ def submit_slurm( slurm_config_path, train_args ):
 		config_basename = os.path.basename( train_args.path )
 		shutil.copy2( train_args.path, os.path.join( worktree_path, config_basename ) )
 
+	# Copy DeepSpeed config into worktree if referenced
+	if train_args.path is not None:
+		cfg = load_config( os.path.join( worktree_path, config_basename ) )
+	else:
+		cfg = copy.deepcopy( DEFAULT_CONFIG )
+
+	ds_config = cfg.get( "training", {} ).get( "deepspeed" )
+	if ds_config is not None and isinstance( ds_config, str ) and os.path.isfile( ds_config ):
+		shutil.copy2( ds_config, os.path.join( worktree_path, os.path.basename( ds_config ) ) )
+
 	# Build the train command
 	python = sys.executable
-	cmd_parts = [ python, os.path.join( worktree_path, "quiet_star_train.py" ), "train" ]
+	script = os.path.join( worktree_path, "quiet_star_train.py" )
+	script_parts = [ script, "train" ]
 	if train_args.path is not None:
-		cmd_parts.append( config_basename )
+		script_parts.append( config_basename )
 	if train_args.resume is not None:
-		cmd_parts.extend( [ "--resume", train_args.resume ] )
-	train_cmd = " ".join( shlex.quote( p ) for p in cmd_parts )
+		script_parts.extend( [ "--resume", train_args.resume ] )
+	script_args = " ".join( shlex.quote( p ) for p in script_parts )
+
+	train_cmd = (
+		f"srun --kill-on-bad-exit=1"
+		f" {shlex.quote( python )} -m torch.distributed.run"
+		f" --nnodes=$SLURM_NNODES"
+		f" --nproc_per_node=1"
+		f" --rdzv_id=$SLURM_JOB_ID"
+		f" --rdzv_backend=c10d"
+		f" --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT"
+		f" {script_args}" )
 
 	# Setup: cd into worktree; cleanup worktree on exit (only if job succeeded)
 	slurm.add_cmd( f"cd {shlex.quote( worktree_path )}" )
@@ -235,6 +258,11 @@ def submit_slurm( slurm_config_path, train_args ):
 	# Run user-provided setup script (e.g. SSH tunnels, module loads)
 	if setup_script is not None:
 		slurm.add_cmd( setup_script )
+
+	# Set up distributed env vars
+	slurm.add_cmd(
+		'export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)' )
+	slurm.add_cmd( 'export MASTER_PORT=${MASTER_PORT:-29500}' )
 
 	# Submit
 	job_id = slurm.sbatch( train_cmd )
