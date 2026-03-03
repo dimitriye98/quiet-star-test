@@ -304,10 +304,12 @@ def train(config, resume_from = None):
 
 		print( "Loading model" )
 
+		# DeepSpeed manages device placement; device_map conflicts with it
+		dm = None if training_args.deepspeed else config["base_model"]["device_map"]
 		lm_model = AutoModelForCausalLM.from_pretrained(
 			config["base_model"]["name"],
 			torch_dtype = dtype,
-			device_map = config["base_model"]["device_map"],
+			device_map = dm,
 		)
 
 		print( "Loaded model" )
