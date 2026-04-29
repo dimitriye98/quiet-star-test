@@ -374,8 +374,22 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		assert kv_cache is not None
 		assert input_ids.device == padding_mask.device
 
+		# Prior LM forward (also populates kv_cache with depth-0 K/V for the broadcast loop)
+		prior_logits, prior_hidden_states = self.naive_forward(
+			input_ids[ :, :-1 ], padding_mask[ :, :-1 ],
+			kv_cache = kv_cache, keep = input_ids.shape[ -1 ] )
+		prior_logits = prior_logits.unfold( -2, self.look_ahead, 1 )
+		prior_logits = x.rearrange( "b l v d -> b n d l v", prior_logits, n = self.n_thoughts )
+		prior_hidden_states = prior_hidden_states.unfold( -2, self.look_ahead, 1 )
+		prior_hidden_states = x.rearrange( "b l e d -> b n d l e", prior_hidden_states, n = self.n_thoughts )
+
 		# Truncate the input by look_ahead
 		truncated_input = input_ids[ ..., :-self.look_ahead ]
+
+		# Crop cache to l = L - look_ahead (one depth slot in the broadcast layout)
+		# and replicate batch dim from b to b*n_thoughts.
+		self.truncate_cache( kv_cache, truncated_input.shape[ -1 ] )
+		self.broadcast_cache_batch( kv_cache, self.n_thoughts )
 
 		# Duplicate the batch for each thought
 		ts = x.rearrange( "b l -> b n 1 l", truncated_input, n = self.n_thoughts )
@@ -396,8 +410,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = self.n_thoughts )[ ..., :-self.look_ahead ],
 			dtype = self.dtype )
 
-		# Generate thoughts
-		layers_cached, layer_to_gen = 0, 2
+		# Generate thoughts (depth 0 already cached from naive_forward)
+		layers_cached, layer_to_gen = 1, 2
 		thought_logits = None
 		for i in range( self.thought_depth ):
 			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
@@ -449,16 +463,6 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# We won't use this anymore, but update it as a matter of hygiene
 		layers_cached = layer_to_gen
 		layer_to_gen += 1
-
-		# Logits without thought
-		prior_logits, prior_hidden_states = self.naive_forward(
-			input_ids[ :, :-1 ], padding_mask[ :, :-1 ], keep = input_ids.shape[-1] )
-		prior_logits = prior_logits.unfold( -2, self.look_ahead, 1 )
-		# prior_logits = t.movedim( prior_logits, -1, -3 )  # b l v d -> b d l v
-		prior_logits = x.rearrange( "b l v d -> b n d l v", prior_logits, n = self.n_thoughts )
-		prior_hidden_states = prior_hidden_states.unfold( -2, self.look_ahead, 1 )
-		# prior_hidden_states = t.movedim( prior_hidden_states, -1, -3 )  # b l e d -> b d l e
-		prior_hidden_states = x.rearrange( "b l e d -> b n d l e", prior_hidden_states, n = self.n_thoughts )
 
 		alpha = self.mixer_head( prior_hidden_states.expand_as( post_hidden_states ), post_hidden_states )
 		logits = alpha * post_logits + (1 - alpha) * prior_logits
@@ -599,6 +603,16 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 	def truncate_cache( cls, kv_cache, l ):
 		if isinstance( kv_cache, DynamicCache ):
 			kv_cache.crop( l )
+		else:
+			raise NotImplementedError( "Only DynamicCache is supported" )
+
+	@classmethod
+	def broadcast_cache_batch( cls, kv_cache, n ):
+		"""Replicate each batch entry n times (interleaved) along batch dim of cache."""
+		if isinstance( kv_cache, DynamicCache ):
+			for i in range( len( kv_cache.key_cache ) ):
+				kv_cache.key_cache[ i ] = kv_cache.key_cache[ i ].repeat_interleave( n, dim = 0 )
+				kv_cache.value_cache[ i ] = kv_cache.value_cache[ i ].repeat_interleave( n, dim = 0 )
 		else:
 			raise NotImplementedError( "Only DynamicCache is supported" )
 
