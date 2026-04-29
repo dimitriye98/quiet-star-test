@@ -98,6 +98,22 @@ def nanmax( x ):
 	return x[ ~x.isnan() ].max()
 
 
+def nancorr( a, b ):
+	"""Pearson correlation across all elements, ignoring positions where either is NaN."""
+	a = a.flatten().float()
+	b = b.flatten().float()
+	mask = ~(a.isnan() | b.isnan())
+	a, b = a[ mask ], b[ mask ]
+	if a.numel() < 2:
+		return t.tensor( float( "nan" ), device = a.device )
+	a_c = a - a.mean()
+	b_c = b - b.mean()
+	denom = a_c.norm() * b_c.norm()
+	if denom == 0:
+		return t.tensor( float( "nan" ), device = a.device )
+	return (a_c * b_c).sum() / denom
+
+
 class ThoughtModelConfig( PretrainedConfig ):
 	model_type = "thought_model"
 	is_composition = True
@@ -533,6 +549,19 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			+ self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss)
 		loss = t.nanmean( loss )
 
+		# Mixer diagnostics (no_grad, logging only)
+		with t.no_grad():
+			pooled_alpha = x.reduce( "b n [d] l a", alpha, op = t.nanmean ).squeeze( -1 )
+			post_advantage = prior_cross_entropy_loss - post_cross_entropy_loss
+			valid_mask = ~(post_cross_entropy_loss.isnan() | prior_cross_entropy_loss.isnan())
+			alpha_masked = pooled_alpha.where( valid_mask, t.tensor( float( "nan" ), device = pooled_alpha.device ) )
+			adv_masked = post_advantage.where( valid_mask, t.tensor( float( "nan" ), device = post_advantage.device ) )
+			weighted_adv_den = t.nansum( alpha_masked )
+			weighted_post_advantage = (
+				(t.nansum( alpha_masked * adv_masked ) / weighted_adv_den).item()
+				if weighted_adv_den > 0 else float( "nan" )
+			)
+
 		stats = {
 			"mixed_cross_entropy_avg": t.nanmean( mixed_cross_entropy_loss ).item(),
 			"mixed_cross_entropy_min": nanmin( mixed_cross_entropy_loss ).item(),
@@ -558,6 +587,9 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			"thought_entropy_avg": t.nanmean( thought_entropy ).item(),
 			"thought_entropy_min": nanmin( thought_entropy ).item(),
 			"thought_entropy_max": nanmax( thought_entropy ).item(),
+			"corr_post_prior_ce": nancorr( post_cross_entropy_loss, prior_cross_entropy_loss ).item(),
+			"corr_alpha_post_advantage": nancorr( pooled_alpha, post_advantage ).item(),
+			"alpha_weighted_post_advantage": weighted_post_advantage,
 			"loss": loss.item()
 		}
 
