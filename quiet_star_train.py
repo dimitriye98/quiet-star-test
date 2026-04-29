@@ -151,6 +151,7 @@ SLURM_TEMPLATE = """\
 # Keys map directly to sbatch options (simple-slurm).
 # See: https://slurm.schedmd.com/sbatch.html
 
+job_name: qstar
 partition: gpu
 gres: "gpu:1"
 time: "24:00:00"
@@ -202,6 +203,7 @@ def submit_slurm( slurm_config_path, train_args ):
 	with open( slurm_config_path ) as f:
 		slurm_params = yaml.safe_load( f )
 	setup_script = slurm_params.pop( "setup", None )
+	slurm_params.setdefault( "job_name", "qstar" )
 	slurm = Slurm( **slurm_params )
 
 	# Copy training config into worktree if provided
