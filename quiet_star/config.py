@@ -27,6 +27,7 @@ DEFAULT_CONFIG = {
 		"beta_mixed": 1.0,
 		"coef_entropy": 0.0,
 		"mixer_init_bias": -5.0,
+		"mixer_zero_init": False,
 	},
 
 	"dataset": {

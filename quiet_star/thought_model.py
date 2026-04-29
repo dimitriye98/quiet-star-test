@@ -114,6 +114,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 			coef_entropy: float = 0.0,
 			gated_reinforce: bool = False,
 			mixer_init_bias: float = -5.0,
+			mixer_zero_init: bool = False,
 			stt_init_id: int = None,
 			ett_init_id: int = None,
 			look_ahead: int = 4,
@@ -136,6 +137,7 @@ class ThoughtModelConfig( PretrainedConfig ):
 		self.coef_entropy = coef_entropy
 		self.gated_reinforce = gated_reinforce
 		self.mixer_init_bias = mixer_init_bias
+		self.mixer_zero_init = mixer_zero_init
 		self.stt_init_id = stt_init_id
 		self.ett_init_id = ett_init_id
 		self.look_ahead = look_ahead
@@ -238,7 +240,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		with t.no_grad():
 			last_layer = self.mixer_head.mlp[ -1 ]
-			last_layer.weight.zero_()
+			if self.config.mixer_zero_init:
+				last_layer.weight.zero_()
 			last_layer.bias.fill_( self.config.mixer_init_bias )
 
 			if self.config.stt_init_id is not None:
