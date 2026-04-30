@@ -292,6 +292,8 @@ def train(config, resume_from = None):
 			if _interrupted:
 				print( "Stopping training gracefully...", file = sys.stderr )
 				control.should_training_stop = True
+				# Trigger a full checkpoint save before exit so the run is resumable.
+				control.should_save = True
 			return control
 
 	class SyncEmbeddingsCallback( TrainerCallback ):
