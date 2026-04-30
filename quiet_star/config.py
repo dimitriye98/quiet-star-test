@@ -17,6 +17,7 @@ DEFAULT_CONFIG = {
 		"n_thoughts": 2,
 		"thought_depth": 8,
 		"look_ahead": 4,
+		"look_ahead_pass": False,
 		"thought_temperature": 3.0,
 		"reinforce_temperature": 3.0,
 		"embedding_scale": 100.0,
