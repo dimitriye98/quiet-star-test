@@ -12,6 +12,23 @@ from functools import partial
 from quiet_star.config import DEFAULT_CONFIG, resolve_torch_dtype, save_config, load_config
 
 
+def _resolve_wandb_cache_dir( root_prefix_arg, path_cfg ):
+	"""Compute the WANDB_CACHE_DIR value relative to the dispatch shell's CWD.
+	Returns None if an existing WANDB_CACHE_DIR should be left alone.
+	Priority: --root-prefix CLI > existing WANDB_CACHE_DIR > config's root_prefix
+	> dispatch CWD. The path is always absolute so it survives env propagation
+	to a Slurm job that runs in a different CWD."""
+	if "WANDB_CACHE_DIR" in os.environ and root_prefix_arg is None:
+		return None
+	if root_prefix_arg is not None:
+		root_prefix = root_prefix_arg
+	elif path_cfg is not None:
+		root_prefix = path_cfg.get( "root_prefix", "." )
+	else:
+		root_prefix = "."
+	return os.path.abspath( os.path.join( os.path.expanduser( root_prefix ), "cache/quietstar/wandb_cache" ) )
+
+
 def _resolve_resume( resume_from ):
 	"""Resolve --resume to (checkpoint_artifact, run). Accepts either a wandb
 	artifact ref (entity/project/name:version) or a run path (entity/project/run_id);
@@ -123,6 +140,13 @@ def submit_slurm( slurm_config_path, train_args ):
 	ds_config = cfg.get( "training", {} ).get( "deepspeed" )
 	if ds_config is not None and isinstance( ds_config, str ) and os.path.isfile( ds_config ):
 		shutil.copy2( ds_config, os.path.join( worktree_path, os.path.basename( ds_config ) ) )
+
+	# Resolve WANDB_CACHE_DIR at dispatch (in the local CWD) so root_prefix="."
+	# in a config means the user's local checkout, not the per-job worktree.
+	# Propagated to the Slurm job via sbatch's default env inheritance.
+	cache_dir = _resolve_wandb_cache_dir( train_args.root_prefix, cfg if train_args.path is not None else None )
+	if cache_dir is not None:
+		os.environ[ "WANDB_CACHE_DIR" ] = cache_dir
 
 	# Build the train command
 	python = sys.executable
@@ -334,7 +358,6 @@ def train(config, resume_from = None):
 	random.seed( config["random_seed"] )
 
 	os.environ[ "WANDB_PROJECT" ] = config["project_name"] + "-" + config["dataset"]["name"].split( "/" )[ -1 ]
-	os.environ[ "WANDB_CACHE_DIR" ] = config["root_prefix"] + "cache/quietstar/wandb_cache"
 	os.environ[ "WANDB_LOG_MODEL" ] = "checkpoint"
 
 	tokenizer = AutoTokenizer.from_pretrained(
@@ -472,6 +495,8 @@ if __name__ == "__main__":
 		help = "W&B checkpoint artifact to resume from" )
 	train_parser.add_argument( "--slurm", metavar = "SLURM_CONFIG", default = None,
 		help = "Submit to Slurm using this config file instead of running locally" )
+	train_parser.add_argument( "--root-prefix", metavar = "PATH", default = None,
+		help = "Root path for cache/output dirs; overrides WANDB_CACHE_DIR and config root_prefix" )
 
 	args = parser.parse_args()
 
@@ -486,10 +511,20 @@ if __name__ == "__main__":
 		if args.slurm is not None:
 			submit_slurm( args.slurm, args )
 		else:
-			if args.path is not None:
-				cfg = load_config( args.path )
-			elif args.resume is not None:
+			# WANDB_CACHE_DIR must be set before any wandb API call (including
+			# config_from_wandb_checkpoint) so the cache used during the original
+			# run matches the cache used on resume.
+			path_cfg = load_config( args.path ) if args.path is not None else None
+			cache_dir = _resolve_wandb_cache_dir( args.root_prefix, path_cfg )
+			if cache_dir is not None:
+				os.environ[ "WANDB_CACHE_DIR" ] = cache_dir
+
+			# When resuming, always use the checkpoint's config — --path is
+			# consulted only for root_prefix above and then discarded.
+			if args.resume is not None:
 				cfg = config_from_wandb_checkpoint( args.resume )
+			elif path_cfg is not None:
+				cfg = path_cfg
 			else:
 				cfg = copy.deepcopy( DEFAULT_CONFIG )
 			train( cfg, resume_from = args.resume )
