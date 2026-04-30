@@ -56,6 +56,7 @@ def _resolve_resume( resume_from ):
 
 def config_from_wandb_checkpoint( resume_from ):
 	"""Download the config artifact from the run associated with --resume."""
+	print( f"[config_from_wandb] WANDB_CACHE_DIR = {os.environ.get( 'WANDB_CACHE_DIR', '<unset>' )}", file = sys.stderr )
 	_, run = _resolve_resume( resume_from )
 	for art in run.logged_artifacts():
 		if art.type == "config":
@@ -147,6 +148,7 @@ def submit_slurm( slurm_config_path, train_args ):
 	cache_dir = _resolve_wandb_cache_dir( train_args.root_prefix, cfg if train_args.path is not None else None )
 	if cache_dir is not None:
 		os.environ[ "WANDB_CACHE_DIR" ] = cache_dir
+	print( f"[submit_slurm] WANDB_CACHE_DIR = {os.environ.get( 'WANDB_CACHE_DIR', '<unset>' )}", file = sys.stderr )
 
 	# Build the train command
 	python = sys.executable
@@ -466,8 +468,11 @@ def train(config, resume_from = None):
 
 	resume_checkpoint = None
 	if resume_from is not None:
+		print( f"[resume] WANDB_CACHE_DIR = {os.environ.get( 'WANDB_CACHE_DIR', '<unset>' )}", file = sys.stderr )
 		artifact, run = _resolve_resume( resume_from )
+		print( f"[resume] downloading artifact {artifact.name} (created {artifact.created_at})", file = sys.stderr )
 		resume_checkpoint = artifact.download()
+		print( f"[resume] artifact materialised at {resume_checkpoint}", file = sys.stderr )
 		os.environ[ "WANDB_RUN_ID" ] = run.id
 		os.environ[ "WANDB_RESUME" ] = "must"
 
@@ -518,6 +523,7 @@ if __name__ == "__main__":
 			cache_dir = _resolve_wandb_cache_dir( args.root_prefix, path_cfg )
 			if cache_dir is not None:
 				os.environ[ "WANDB_CACHE_DIR" ] = cache_dir
+			print( f"[main] WANDB_CACHE_DIR = {os.environ.get( 'WANDB_CACHE_DIR', '<unset>' )}", file = sys.stderr )
 
 			# When resuming, always use the checkpoint's config — --path is
 			# consulted only for root_prefix above and then discarded.
