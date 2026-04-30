@@ -332,7 +332,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			output_hidden_states = True,
 			return_dict = True,
 			cache_position = cache_pos,
-			num_logits_to_keep = l * keep,
+			logits_to_keep = l * keep,
 		)
 
 		log = x.rearrange( "(b n) (d l) v -> b n d l v", out.logits, b = b, n = n, d = keep, l = l )
@@ -360,7 +360,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			output_hidden_states = True,
 			return_dict = True,
 			cache_position = cache_pos,
-			num_logits_to_keep = keep,
+			logits_to_keep = keep,
 		)
 
 		log = out.logits
