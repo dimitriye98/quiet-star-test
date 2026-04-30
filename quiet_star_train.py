@@ -30,13 +30,16 @@ def _resolve_wandb_cache_dir( root_prefix_arg, path_cfg ):
 
 
 def _resolve_resume( resume_from ):
-	"""Resolve --resume to (checkpoint_artifact, run). Accepts either a wandb
-	artifact ref (entity/project/name:version) or a run path (entity/project/run_id);
-	for a run path, picks the most recently logged mid-training checkpoint
-	(identified by a `checkpoint_global_step_<step>` alias, which is what HF's
-	WandbCallback.on_save tags resumable checkpoints with — distinct from
-	end-of-train artifacts tagged `last`/`best`, which only contain model weights
-	and aren't resumable)."""
+	"""Resolve --resume to (checkpoint_artifact, run) and set WANDB_RUN_ID/RESUME
+	in env as a side effect — this needs to happen as early as possible (before
+	any further wandb operation that might cache settings) so that wandb.init()
+	in WandbCallback.setup() resumes the original run rather than starting a new
+	one. Accepts either a wandb artifact ref (entity/project/name:version) or a
+	run path (entity/project/run_id); for a run path, picks the most recently
+	logged mid-training checkpoint (identified by a `checkpoint_global_step_<step>`
+	alias, which is what HF's WandbCallback.on_save tags resumable checkpoints
+	with — distinct from end-of-train artifacts tagged `last`/`best`, which only
+	contain model weights and aren't resumable)."""
 	import wandb
 	api = wandb.Api()
 	if ":" in resume_from.rsplit( "/", 1 )[ -1 ]:
@@ -51,6 +54,8 @@ def _resolve_resume( resume_from ):
 		if not candidates:
 			raise ValueError( f"No resumable mid-training checkpoints logged by run {resume_from} (only end-of-train artifacts found)" )
 		artifact = max( candidates, key = lambda a: a.created_at )
+	os.environ[ "WANDB_RUN_ID" ] = run.id
+	os.environ[ "WANDB_RESUME" ] = "must"
 	return artifact, run
 
 
@@ -473,11 +478,10 @@ def train(config, resume_from = None):
 		print( f"[resume] downloading artifact {artifact.name} (created {artifact.created_at})", file = sys.stderr )
 		resume_checkpoint = artifact.download()
 		print( f"[resume] artifact materialised at {resume_checkpoint}", file = sys.stderr )
-		os.environ[ "WANDB_RUN_ID" ] = run.id
-		os.environ[ "WANDB_RESUME" ] = "must"
 
 	print("distributed_type:", trainer.accelerator.distributed_type)
 	print("deepspeed_plugin:", trainer.accelerator.state.deepspeed_plugin)
+	print( "[pre-train] WANDB_*:", { k: v for k, v in os.environ.items() if k.startswith( "WANDB_" ) }, file = sys.stderr )
 
 	trainer.train( resume_from_checkpoint = resume_checkpoint )
 
