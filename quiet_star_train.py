@@ -387,6 +387,9 @@ def train(config, resume_from = None):
 		artifact = api.artifact( resume_from )
 		resume_checkpoint = artifact.download()
 
+	print("distributed_type:", trainer.accelerator.distributed_type)
+	print("deepspeed_plugin:", trainer.accelerator.state.deepspeed_plugin)
+
 	trainer.train( resume_from_checkpoint = resume_checkpoint )
 
 
