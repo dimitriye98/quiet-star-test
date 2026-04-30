@@ -220,12 +220,16 @@ def submit_slurm( slurm_config_path, train_args ):
 		cmd_parts.extend( [ "--resume", train_args.resume ] )
 	train_cmd = " ".join( shlex.quote( p ) for p in cmd_parts )
 
-	# Setup: cd into worktree; cleanup worktree on exit
+	# Setup: cd into worktree; cleanup worktree on exit (only if job succeeded)
 	slurm.add_cmd( f"cd {shlex.quote( worktree_path )}" )
 	slurm.add_cmd(
-		f"trap 'kill $(jobs -p) 2>/dev/null;"
-		f" git -C {shlex.quote( repo_root )} worktree remove"
-		f" {shlex.quote( worktree_path )} --force' EXIT"
+		f"trap 'rc=$?;"
+		f" kill $(jobs -p) 2>/dev/null;"
+		f" if [ $rc -eq 0 ]; then"
+		f"  git -C {shlex.quote( repo_root )} worktree remove {shlex.quote( worktree_path )} --force;"
+		f" else"
+		f'  echo "Job failed (exit $rc); preserving worktree: {worktree_path}" >&2;'
+		f" fi' EXIT"
 	)
 
 	# Run user-provided setup script (e.g. SSH tunnels, module loads)
