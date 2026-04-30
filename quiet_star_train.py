@@ -154,14 +154,13 @@ _interrupted = False
 
 
 def _graceful_exit_handler( signum, frame ):
-	"""On first interrupt, set flag and switch to default handler so second interrupt force-quits."""
+	"""Set flag on first interrupt; ignore subsequent signals so cleanup (e.g. wandb artifact upload) can finish. SIGKILL via scancel is still available as an escape hatch."""
 	global _interrupted
-	signal.signal( signal.SIGINT, signal.SIG_DFL )
-	signal.signal( signal.SIGTERM, signal.SIG_DFL )
+	signal.signal( signal.SIGINT, signal.SIG_IGN )
+	signal.signal( signal.SIGTERM, signal.SIG_IGN )
 	_interrupted = True
 	name = signal.Signals( signum ).name
 	print( f"\n{name} received. Will stop after current step...", file = sys.stderr )
-	print( "(Press Ctrl+C again to force quit)", file = sys.stderr )
 
 
 def train(config, resume_from = None):
@@ -180,6 +179,7 @@ def train(config, resume_from = None):
 	from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel, DynamicCache, PreTrainedModel, \
 		DataCollator, PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin, \
 		EvalPrediction, TrainerCallback, TrainingArguments, Trainer
+	from transformers.integrations import WandbCallback
 	from liger_kernel.transformers import AutoLigerKernelForCausalLM
 	from datasets import load_dataset
 	from quiet_star.eval_helpers import preprocess_function
@@ -278,6 +278,30 @@ def train(config, resume_from = None):
 				m = model.module if hasattr( model, "module" ) else model
 				m.sync_thought_embeddings()
 			return control
+
+	class DeepSpeedSafeWandbCallback( WandbCallback ):
+		# Default WandbCallback.on_train_end builds a throwaway Trainer to call
+		# save_model(); under DeepSpeed that constructs a second Accelerator with
+		# the same deepspeed_plugin and Accelerate refuses. Reuse the live trainer.
+		def __init__( self ):
+			super().__init__()
+			self._trainer = None
+
+		def bind( self, trainer ):
+			self._trainer = trainer
+
+		def on_train_end( self, args, state, control, **kwargs ):
+			if not ( self._initialized and state.is_world_process_zero ):
+				return
+			if not self._log_model.is_enabled or self._trainer is None:
+				return
+			import wandb
+			name = "best" if args.load_best_model_at_end else "last"
+			output_dir = os.path.join( args.output_dir, name )
+			self._trainer.save_model( output_dir )
+			artifact = wandb.Artifact( name = f"model-{wandb.run.id}", type = "model" )
+			artifact.add_dir( output_dir )
+			wandb.run.log_artifact( artifact, aliases = [ name ] )
 
 	signal.signal( signal.SIGINT, _graceful_exit_handler )
 	signal.signal( signal.SIGTERM, _graceful_exit_handler )
@@ -380,6 +404,18 @@ def train(config, resume_from = None):
 		eval_lm_batch_size = eval_lm_batch_size,
 		callbacks = [ ConfigArtifactCallback( config ), GracefulStopCallback(), SyncEmbeddingsCallback() ],
 	)
+
+	# Replace the auto-registered WandbCallback in place: appending instead would
+	# move it to the end of the list, so user callbacks like ConfigArtifactCallback
+	# would run before wandb.run is initialized and silently no-op.
+	wandb_cb = DeepSpeedSafeWandbCallback()
+	wandb_cb.bind( trainer )
+	for i, cb in enumerate( trainer.callback_handler.callbacks ):
+		if type( cb ) is WandbCallback:
+			trainer.callback_handler.callbacks[ i ] = wandb_cb
+			break
+	else:
+		trainer.callback_handler.add_callback( wandb_cb )
 
 	resume_checkpoint = None
 	if resume_from is not None:

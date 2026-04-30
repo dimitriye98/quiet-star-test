@@ -118,6 +118,7 @@ def nancorr( a, b ):
 class ThoughtModelConfig( PretrainedConfig ):
 	model_type = "thought_model"
 	is_composition = True
+	has_no_defaults_at_init = True
 	sub_configs = { "mixer_config": MixerConfig, "text_config": AutoConfig }
 
 	def __init__(
