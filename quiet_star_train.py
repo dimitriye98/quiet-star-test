@@ -12,12 +12,34 @@ from functools import partial
 from quiet_star.config import DEFAULT_CONFIG, resolve_torch_dtype, save_config, load_config
 
 
-def config_from_wandb_checkpoint( checkpoint_ref ):
-	"""Download the config artifact from the run that produced a checkpoint."""
+def _resolve_resume( resume_from ):
+	"""Resolve --resume to (checkpoint_artifact, run). Accepts either a wandb
+	artifact ref (entity/project/name:version) or a run path (entity/project/run_id);
+	for a run path, picks the most recently logged mid-training checkpoint
+	(identified by a `checkpoint_global_step_<step>` alias, which is what HF's
+	WandbCallback.on_save tags resumable checkpoints with — distinct from
+	end-of-train artifacts tagged `last`/`best`, which only contain model weights
+	and aren't resumable)."""
 	import wandb
 	api = wandb.Api()
-	checkpoint = api.artifact( checkpoint_ref )
-	run = checkpoint.logged_by()
+	if ":" in resume_from.rsplit( "/", 1 )[ -1 ]:
+		artifact = api.artifact( resume_from )
+		run = artifact.logged_by()
+	else:
+		run = api.run( resume_from )
+		candidates = [
+			a for a in run.logged_artifacts()
+			if a.type == "model" and any( al.startswith( "checkpoint_global_step_" ) for al in a.aliases )
+		]
+		if not candidates:
+			raise ValueError( f"No resumable mid-training checkpoints logged by run {resume_from} (only end-of-train artifacts found)" )
+		artifact = max( candidates, key = lambda a: a.created_at )
+	return artifact, run
+
+
+def config_from_wandb_checkpoint( resume_from ):
+	"""Download the config artifact from the run associated with --resume."""
+	_, run = _resolve_resume( resume_from )
 	for art in run.logged_artifacts():
 		if art.type == "config":
 			config_dir = art.download()
@@ -419,10 +441,10 @@ def train(config, resume_from = None):
 
 	resume_checkpoint = None
 	if resume_from is not None:
-		import wandb
-		api = wandb.Api()
-		artifact = api.artifact( resume_from )
+		artifact, run = _resolve_resume( resume_from )
 		resume_checkpoint = artifact.download()
+		os.environ[ "WANDB_RUN_ID" ] = run.id
+		os.environ[ "WANDB_RESUME" ] = "must"
 
 	print("distributed_type:", trainer.accelerator.distributed_type)
 	print("deepspeed_plugin:", trainer.accelerator.state.deepspeed_plugin)
