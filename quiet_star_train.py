@@ -180,6 +180,7 @@ def train(config, resume_from = None):
 	from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel, DynamicCache, PreTrainedModel, \
 		DataCollator, PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin, \
 		EvalPrediction, TrainerCallback, TrainingArguments, Trainer
+	from liger_kernel.transformers import AutoLigerKernelForCausalLM
 	from datasets import load_dataset
 	from quiet_star.eval_helpers import preprocess_function
 
@@ -308,7 +309,7 @@ def train(config, resume_from = None):
 
 		# DeepSpeed manages device placement; device_map conflicts with it
 		dm = None if training_args.deepspeed else config["base_model"]["device_map"]
-		lm_model = AutoModelForCausalLM.from_pretrained(
+		lm_model = AutoLigerKernelForCausalLM.from_pretrained(
 			config["base_model"]["name"],
 			torch_dtype = dtype,
 			device_map = dm,

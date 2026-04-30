@@ -4,6 +4,7 @@ import torch as t
 from transformers import GenerationMixin, PreTrainedModel, DynamicCache, PretrainedConfig, AutoConfig, AutoModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutput
+from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 
 
 class WeightedMixerHead( t.nn.Module ):
@@ -226,6 +227,11 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		self.lm_model = lm_model if lm_model is not None else AutoModel.from_config( config.text_config )
 		self.mixer_head = WeightedMixerHead( config, lm_model.config.hidden_size ).to( dtype = self.lm_model.dtype )
 
+		self._flce = LigerFusedLinearCrossEntropyLoss(
+			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
+			reduction = "none",
+		)
+
 		self.embedding_scale = config.embedding_scale
 		hidden_size = self.lm_model.config.hidden_size
 		self.start_embedding = t.nn.Parameter( t.zeros( hidden_size, dtype = self.lm_model.dtype ) )
@@ -304,7 +310,18 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		layers = t.arange( d_bot, d_top, device = device )
 		return t.arange( l, device = device ) + l * layers.unsqueeze( -1 )
 
-	def broadcast_logits( self, ts, kv_cache, layers_cached, layer_to_gen, mask, keep = 1 ):
+	def _flce_loss( self, hidden, targets, *, scale = 1.0 ):
+		"""Fused linear + CE on hidden states. Returns per-token loss shaped like targets."""
+		e = hidden.shape[ -1 ]
+		h = hidden.reshape( -1, e )
+		if scale != 1.0:
+			h = h / scale
+		bias = getattr( self.lm_model.lm_head, "bias", None )
+		return self._flce(
+			self.lm_model.lm_head.weight, h, targets.reshape( -1 ), bias
+		).reshape_as( targets )
+
+	def broadcast_forward( self, ts, kv_cache, layers_cached, layer_to_gen, mask, keep = 1, *, compute_logits = True ):
 		b, n, d, l = ts.shape
 
 		if keep is None:
@@ -322,26 +339,44 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			"d l -> (b n) (d l)", t.arange( l, device = ts.device ) + (t.arange( d, device = ts.device ) + layers_cached).unsqueeze( -1 ),
 			b = b, n = n )
 
-		out = self.lm_model(
-			inputs_embeds = inputs_embeds,
-			position_ids = position_ids,
-			attention_mask = a_mask,
-			past_key_values = kv_cache,
-			use_cache = kv_cache is not None,
-			output_attentions = False,
-			output_hidden_states = True,
-			return_dict = True,
-			cache_position = cache_pos,
-			logits_to_keep = l * keep,
-		)
+		if compute_logits:
+			out = self.lm_model(
+				inputs_embeds = inputs_embeds,
+				position_ids = position_ids,
+				attention_mask = a_mask,
+				past_key_values = kv_cache,
+				use_cache = kv_cache is not None,
+				output_attentions = False,
+				output_hidden_states = True,
+				return_dict = True,
+				cache_position = cache_pos,
+				logits_to_keep = l * keep,
+			)
 
-		log = x.rearrange( "(b n) (d l) v -> b n d l v", out.logits, b = b, n = n, d = keep, l = l )
-		hidden = x.rearrange( "(b n) (d l) e -> b n d l e", out.hidden_states[ -1 ], b = b, n = n, d = d, l = l )[ ...,
-		-keep:, :, : ]
+			log = x.rearrange( "(b n) (d l) v -> b n d l v", out.logits, b = b, n = n, d = keep, l = l )
+			hidden = x.rearrange( "(b n) (d l) e -> b n d l e", out.hidden_states[ -1 ], b = b, n = n, d = d, l = l )[ ...,
+			-keep:, :, : ]
 
-		return log, hidden
+			return log, hidden
+		else:
+			out = self.lm_model.model(
+				inputs_embeds = inputs_embeds,
+				position_ids = position_ids,
+				attention_mask = a_mask,
+				past_key_values = kv_cache,
+				use_cache = kv_cache is not None,
+				output_attentions = False,
+				output_hidden_states = False,
+				return_dict = True,
+				cache_position = cache_pos,
+			)
 
-	def naive_forward( self, input_ids, padding_mask, kv_cache = None, cache_pos = None, keep = 1 ):
+			hidden = x.rearrange( "(b n) (d l) e -> b n d l e", out.last_hidden_state, b = b, n = n, d = d, l = l )[ ...,
+			-keep:, :, : ]
+
+			return None, hidden
+
+	def naive_forward( self, input_ids, padding_mask, kv_cache = None, cache_pos = None, keep = 1, *, compute_logits = True ):
 		assert cache_pos is None or input_ids.shape[ -1 ] == cache_pos.shape[ -1 ]
 		assert padding_mask.shape[ -1 ] == input_ids.shape[ -1 ] + (
 			kv_cache.get_seq_length() if kv_cache is not None else 0)
@@ -351,33 +386,47 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		else:
 			model_input = { "input_ids": input_ids }
 
-		out = self.lm_model(
-			**model_input,
-			attention_mask = padding_mask,
-			past_key_values = kv_cache,
-			use_cache = kv_cache is not None,
-			output_attentions = False,
-			output_hidden_states = True,
-			return_dict = True,
-			cache_position = cache_pos,
-			logits_to_keep = keep,
-		)
+		if compute_logits:
+			out = self.lm_model(
+				**model_input,
+				attention_mask = padding_mask,
+				past_key_values = kv_cache,
+				use_cache = kv_cache is not None,
+				output_attentions = False,
+				output_hidden_states = True,
+				return_dict = True,
+				cache_position = cache_pos,
+				logits_to_keep = keep,
+			)
 
-		log = out.logits
-		hidden = out.hidden_states[ -1 ][ ..., -keep:, : ]
+			log = out.logits
+			hidden = out.hidden_states[ -1 ][ ..., -keep:, : ]
 
-		return log, hidden
+			return log, hidden
+		else:
+			out = self.lm_model.model(
+				**model_input,
+				attention_mask = padding_mask,
+				past_key_values = kv_cache,
+				use_cache = kv_cache is not None,
+				output_attentions = False,
+				output_hidden_states = False,
+				return_dict = True,
+				cache_position = cache_pos,
+			)
+
+			hidden = out.last_hidden_state[ ..., -keep:, : ]
+
+			return None, hidden
 
 	def training_forward( self, input_ids, labels, padding_mask, thought_temperature, *, kv_cache ):
 		assert kv_cache is not None
 		assert input_ids.device == padding_mask.device
 
 		# Prior LM forward (also populates kv_cache with depth-0 K/V for the broadcast loop)
-		prior_logits, prior_hidden_states = self.naive_forward(
+		_, prior_hidden_states = self.naive_forward(
 			input_ids[ :, :-1 ], padding_mask[ :, :-1 ],
-			kv_cache = kv_cache, keep = input_ids.shape[ -1 ] )
-		prior_logits = prior_logits.unfold( -2, self.look_ahead, 1 )
-		prior_logits = x.rearrange( "b l v d -> b n d l v", prior_logits, n = self.n_thoughts )
+			kv_cache = kv_cache, keep = input_ids.shape[ -1 ], compute_logits = False )
 		prior_hidden_states = prior_hidden_states.unfold( -2, self.look_ahead, 1 )
 		prior_hidden_states = x.rearrange( "b l e d -> b n d l e", prior_hidden_states, n = self.n_thoughts )
 
@@ -409,25 +458,40 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			dtype = self.dtype )
 
 		# Generate thoughts (depth 0 already cached from naive_forward)
+		# We accumulate hidden states (for FLCE later) and per-slice entropy (for logging).
+		# Slice logits are computed for sampling, then discarded — the giant thought_logits
+		# tensor is never materialized.
 		layers_cached, layer_to_gen = 1, 2
-		thought_logits = None
+		thought_hidden_states = None
+		thought_entropy_acc = None
 		for i in range( self.thought_depth ):
 			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
 
-			new_logs, _ = self.broadcast_logits(
+			new_logs, new_hidden = self.broadcast_forward(
 				ts[ :, :, layers_cached: layer_to_gen, : ],
 				kv_cache,
 				layers_cached,
 				layer_to_gen,
-				slice_mask )  # Discard hidden states
+				slice_mask )
 
 			if i == 0:
-				thought_logits = new_logs
+				thought_hidden_states = new_hidden
 			else:
-				thought_logits = t.cat( (thought_logits, new_logs), dim = -3 )
+				thought_hidden_states = t.cat( (thought_hidden_states, new_hidden), dim = -3 )
 
 			new_toks = self.sample_thoughts( new_logs, thought_temperature ).detach()
 
+			# Per-slice entropy under no_grad — reuses the just-computed slice logits so we
+			# don't have to recompute lm_head for the entropy stat.
+			with t.no_grad():
+				slice_log_probs = t.nn.functional.log_softmax( new_logs / self.reinforce_temperature, dim = -1 )
+				slice_entropy = -(slice_log_probs.exp() * slice_log_probs).sum( dim = -1 )
+				if i == 0:
+					thought_entropy_acc = slice_entropy
+				else:
+					thought_entropy_acc = t.cat( (thought_entropy_acc, slice_entropy), dim = -2 )
+
+			del new_logs
 
 			layers_cached = layer_to_gen
 			layer_to_gen += 1
@@ -448,7 +512,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# Append the targets to the thoughts (minus one for teacher forcing shift)
 		ts = t.cat( (ts, targets[ :, :, :-1, : ]), dim = -2 )
 
-		# Logits with thought
+		# Hidden states with thought (no lm_head — losses are fused via FLCE below)
 		if self.look_ahead_pass:
 			# Sequential look-ahead: process one look-ahead position per LM forward pass.
 			# Equivalent to the batched path (KV cache makes it mathematically identical),
@@ -456,84 +520,72 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			# At entry: layers_cached covers [0, last_thought), layer_to_gen one past end_tok.
 			# - iter 0: slice = [last_thought, end_tok] (2 layers), keep=1 -> end_tok logit = label[l+1]
 			# - iters 1..look_ahead-1: slice = [target_{i-1}] (1 layer), keep=1 -> label[l+i+1]
-			post_logits, post_hidden_states = None, None
+			post_hidden_states = None
 			for i in range( self.look_ahead ):
 				if i > 0:
 					layer_to_gen += 1
 				slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
-				log, hidden = self.broadcast_logits(
+				_, hidden = self.broadcast_forward(
 					ts[ :, :, layers_cached: layer_to_gen, : ],
 					kv_cache,
 					layers_cached,
 					layer_to_gen,
 					slice_mask,
-					keep = 1 )
+					keep = 1,
+					compute_logits = False )
 				if i == 0:
-					post_logits, post_hidden_states = log, hidden
+					post_hidden_states = hidden
 				else:
-					post_logits = t.cat( (post_logits, log), dim = -3 )
 					post_hidden_states = t.cat( (post_hidden_states, hidden), dim = -3 )
 				layers_cached = layer_to_gen
 		else:
 			layer_to_gen += self.look_ahead - 1  # -1 because targets have one fewer layer for teacher forcing shift
 			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
-			post_logits, post_hidden_states = self.broadcast_logits(
+			_, post_hidden_states = self.broadcast_forward(
 				ts[ :, :, layers_cached: layer_to_gen, : ],
 				kv_cache,
 				layers_cached,
 				layer_to_gen,
 				slice_mask,
-				keep = self.look_ahead )
+				keep = self.look_ahead,
+				compute_logits = False )
 			# We won't use this anymore, but update it as a matter of hygiene
 			layers_cached = layer_to_gen
 			layer_to_gen += 1
 
-		alpha = self.mixer_head( prior_hidden_states.expand_as( post_hidden_states ), post_hidden_states )
-		logits = alpha * post_logits + (1 - alpha) * prior_logits
+		# Mix at hidden level. lm_head is linear and alpha has shape (..., 1) (per-token scalar
+		# gate broadcasting over hidden), so this is mathematically equivalent to mixing logits.
+		prior_hidden_for_mix = prior_hidden_states.expand_as( post_hidden_states )
+		alpha = self.mixer_head( prior_hidden_for_mix, post_hidden_states )
+		mixed_hidden = alpha * post_hidden_states + (1 - alpha) * prior_hidden_for_mix
 
-		# Compute cross entropy loss
-		v = logits.shape[ -1 ]
-		mixed_cross_entropy_loss = t.nn.functional.cross_entropy(
-			logits.reshape( -1, v ), targets.reshape( -1 ),
-			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
-			reduction = "none" ).reshape_as( targets )
-		mixed_cross_entropy_loss = mixed_cross_entropy_loss.masked_fill(
-			x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
-		# Pool loss per thought
+		mask_for_loss = x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ]
+
+		# Mixed CE
+		mixed_cross_entropy_loss = self._flce_loss( mixed_hidden, targets )
+		mixed_cross_entropy_loss = mixed_cross_entropy_loss.masked_fill( mask_for_loss, t.nan )
 		mixed_cross_entropy_loss = x.reduce( "b n [d] l", mixed_cross_entropy_loss, op = t.nanmean )
 
-		# Compute prior cross entropy loss
-		v = prior_logits.shape[ -1 ]
-		prior_cross_entropy_loss = t.nn.functional.cross_entropy(
-			prior_logits.reshape( -1, v ), targets.reshape( -1 ),
-			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
-			reduction = "none" ).reshape_as( targets )
-		prior_cross_entropy_loss = prior_cross_entropy_loss.masked_fill(
-			x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
-		# Pool loss per thought
+		# Prior CE — same across thoughts, so the FLCE matmul is computed on (b, look_ahead, l, e)
+		# (saves the lm_head matmul cost over n_thoughts) and then broadcast back over n for
+		# downstream use. Targets are identical across n by construction.
+		prior_hidden_per_b = prior_hidden_states[ :, 0 ].contiguous()
+		prior_loss_per_b = self._flce_loss( prior_hidden_per_b, targets[ :, 0 ] )
+		prior_cross_entropy_loss = prior_loss_per_b.unsqueeze( 1 ).expand( -1, self.n_thoughts, -1, -1 ).contiguous()
+		prior_cross_entropy_loss = prior_cross_entropy_loss.masked_fill( mask_for_loss, t.nan )
 		prior_cross_entropy_loss = x.reduce( "b n [d] l", prior_cross_entropy_loss, op = t.nanmean )
 
-		# Compute posterior cross entropy (for REINFORCE reward, not directly optimized)
+		# Posterior CE (for REINFORCE reward, not directly optimized)
 		with t.no_grad():
-			v = post_logits.shape[ -1 ]
-			post_cross_entropy_loss = t.nn.functional.cross_entropy(
-				post_logits.reshape( -1, v ), targets.reshape( -1 ),
-				ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
-				reduction = "none" ).reshape_as( targets )
-			post_cross_entropy_loss = post_cross_entropy_loss.masked_fill(
-				x.rearrange( "b l -> b 1 1 l", (~padding_mask.bool()) )[ ..., :-self.look_ahead ], t.nan )
-			# Pool loss per thought
+			post_cross_entropy_loss = self._flce_loss( post_hidden_states, targets )
+			post_cross_entropy_loss = post_cross_entropy_loss.masked_fill( mask_for_loss, t.nan )
 			post_cross_entropy_loss = x.reduce( "b n [d] l", post_cross_entropy_loss, op = t.nanmean )
 
-		# Compute thought cross-entropy (REINFORCE log-probabilities)
+		# Thought CE (REINFORCE log-probabilities). Temperature scaling is applied to the hidden
+		# state — equivalent to dividing logits by T since lm_head is linear.
 		thought_targets = ts[ ..., 2:2 + self.thought_depth, : ]
-		v = thought_logits.shape[ -1 ]
-		thought_ce = t.nn.functional.cross_entropy(
-			thought_logits.reshape( -1, v ) / self.reinforce_temperature, thought_targets.reshape( -1 ),
-			ignore_index = self.pad_token_id if self.pad_token_id is not None else -100,
-			reduction = "none" ).reshape_as( thought_targets )
+		thought_ce = self._flce_loss( thought_hidden_states, thought_targets, scale = self.reinforce_temperature )
 		thought_ce = thought_ce.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
-		# Pool loss per thought
 		thought_ce = x.reduce( "b n [d] l", thought_ce, op = t.nanmean )
 
 		# Compute soft-reward advantage (max-entropy RL)
@@ -549,12 +601,10 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# Apply REINFORCE loss
 		thought_loss = thought_ce * advantage
 
-		# Compute thought entropy for logging (no grad — only used for stats)
-		with t.no_grad():
-			thought_log_probs = t.nn.functional.log_softmax( thought_logits / self.reinforce_temperature, dim = -1 )
-			thought_entropy = -(thought_log_probs.exp() * thought_log_probs).sum( dim = -1 )
-			thought_entropy = thought_entropy.masked_fill( x.rearrange("b l -> b 1 1 l", ~padding_mask.bool())[ ..., :-self.look_ahead ], t.nan )
-			thought_entropy = x.reduce( "b n [d] l", thought_entropy, op = t.nanmean )
+		# Thought entropy was accumulated per-slice inside the generation loop (no_grad).
+		thought_entropy = thought_entropy_acc.masked_fill(
+			x.rearrange( "b l -> b 1 1 l", ~padding_mask.bool() )[ ..., :-self.look_ahead ], t.nan )
+		thought_entropy = x.reduce( "b n [d] l", thought_entropy, op = t.nanmean )
 
 		# # Compute confidence loss
 		# conf_alpha = alpha[ ..., 1:, :-(self.look_ahead - 1), : ]
@@ -621,7 +671,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			"loss": loss.item()
 		}
 
-		return loss, logits, stats
+		return loss, None, stats
 
 	@classmethod
 	def truncate_cache( cls, kv_cache, l ):
