@@ -292,6 +292,8 @@ def train(config, resume_from = None):
 		config["base_model"]["name"],
 		padding_side = config["base_model"]["tokenizer_padding_side"],
 	)
+	if tokenizer.pad_token_id is None:
+		tokenizer.pad_token_id = tokenizer.eos_token_id
 
 	def model_init( p ):
 		params = copy.deepcopy( config["thought_model"] )
@@ -313,8 +315,6 @@ def train(config, resume_from = None):
 		)
 
 		print( "Loaded model" )
-		if tokenizer.pad_token_id is None:
-			tokenizer.pad_token_id = tokenizer.eos_token_id
 
 		params[ "pad_token_id" ] = tokenizer.pad_token_id
 
@@ -349,7 +349,8 @@ def train(config, resume_from = None):
 	)
 
 	train_dataset = dataset.shuffle( seed = config["random_seed"] ).map(
-		partial( preprocess_function, max_length = ds_cfg["train_snippet_length"] ), batched = True, writer_batch_size = 200 )
+		partial( preprocess_function, tokenizer = tokenizer, max_length = ds_cfg["train_snippet_length"] ),
+		batched = True, writer_batch_size = 200 )
 	print( "Loaded datasets" )
 
 	tr = copy.deepcopy( config["training"] )
