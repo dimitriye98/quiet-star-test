@@ -56,7 +56,6 @@ DEFAULT_CONFIG = {
 		"save_steps": 500,
 		"deepspeed": "ds_config.json",
 		"label_names": ["labels"],
-		"include_inputs_for_metrics": True,
 		"log_level": "warning",
 		"report_to": "wandb",
 	},
