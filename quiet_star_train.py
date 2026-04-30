@@ -319,12 +319,27 @@ def train(config, resume_from = None):
 			wandb.run.log_artifact( artifact )
 
 	class GracefulStopCallback( TrainerCallback ):
+		def __init__( self ):
+			self._trainer = None
+		def bind( self, trainer ):
+			self._trainer = trainer
+		def _save_and_exit( self, args, state, control ):
+			# should_save is a no-op on substep_end; sys.exit skips on_train_end's duplicate "last" upload.
+			print( "Saving checkpoint and exiting...", file = sys.stderr )
+			self._trainer._save_checkpoint( self._trainer.model, trial = None )
+			self._trainer.callback_handler.on_save( args, state, control )
+			import wandb
+			if wandb.run is not None:
+				wandb.finish()
+			sys.exit( 0 )
+		# Check per substep: a full optimizer step can outlast Slurm's preemption grace period.
+		def on_substep_end( self, args, state, control, **kwargs ):
+			if _interrupted:
+				self._save_and_exit( args, state, control )
+			return control
 		def on_step_end( self, args, state, control, **kwargs ):
 			if _interrupted:
-				print( "Stopping training gracefully...", file = sys.stderr )
-				control.should_training_stop = True
-				# Trigger a full checkpoint save before exit so the run is resumable.
-				control.should_save = True
+				self._save_and_exit( args, state, control )
 			return control
 
 	class SyncEmbeddingsCallback( TrainerCallback ):
@@ -476,6 +491,7 @@ def train(config, resume_from = None):
 
 	training_args = TrainingArguments( **tr )
 
+	graceful_cb = GracefulStopCallback()
 	trainer = TrainerWithCache(
 		args = training_args,
 		train_dataset = train_dataset,
@@ -483,8 +499,9 @@ def train(config, resume_from = None):
 		model_init = model_init,
 		processing_class = tokenizer,
 		eval_lm_batch_size = eval_lm_batch_size,
-		callbacks = [ ConfigArtifactCallback( config ), GracefulStopCallback(), SyncEmbeddingsCallback() ],
+		callbacks = [ ConfigArtifactCallback( config ), graceful_cb, SyncEmbeddingsCallback() ],
 	)
+	graceful_cb.bind( trainer )
 
 	# Replace the auto-registered WandbCallback in place: appending instead would
 	# move it to the end of the list, so user callbacks like ConfigArtifactCallback
