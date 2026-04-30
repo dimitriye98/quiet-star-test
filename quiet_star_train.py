@@ -345,6 +345,25 @@ def train(config, resume_from = None):
 		def bind( self, trainer ):
 			self._trainer = trainer
 
+		def setup( self, args, state, model, **kwargs ):
+			# When resuming, pre-init wandb with explicit id/resume args. Env vars
+			# alone don't work: wandb caches its session settings on the first
+			# wandb.Api() call (made by _resolve_resume), and any later changes to
+			# WANDB_RUN_ID/RESUME are silently dropped — wandb prints a "session
+			# already started" warning. Explicit init args bypass that caching.
+			# Once wandb.run is non-None, the parent setup() skips init.
+			if (
+				state.is_world_process_zero
+				and self._wandb.run is None
+				and os.environ.get( "WANDB_RUN_ID" )
+			):
+				self._wandb.init(
+					project = os.getenv( "WANDB_PROJECT", "huggingface" ),
+					id = os.environ[ "WANDB_RUN_ID" ],
+					resume = os.environ.get( "WANDB_RESUME", "must" ),
+				)
+			super().setup( args, state, model, **kwargs )
+
 		def on_train_end( self, args, state, control, **kwargs ):
 			if not ( self._initialized and state.is_world_process_zero ):
 				return
