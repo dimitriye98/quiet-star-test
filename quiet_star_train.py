@@ -181,7 +181,7 @@ def train(config, resume_from = None):
 		DataCollator, PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin, \
 		EvalPrediction, TrainerCallback, TrainingArguments, Trainer
 	from datasets import load_dataset
-	from quiet_star.eval_helpers import preprocess_function, compute_metrics
+	from quiet_star.eval_helpers import preprocess_function
 
 	torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -373,7 +373,6 @@ def train(config, resume_from = None):
 		args = training_args,
 		train_dataset = train_dataset,
 		eval_dataset = [ "commonsense_qa" ],
-		compute_metrics = compute_metrics,
 		model_init = model_init,
 		processing_class = tokenizer,
 		eval_lm_batch_size = eval_lm_batch_size,
