@@ -169,7 +169,7 @@ def submit_slurm( slurm_config_path, train_args ):
 		f"srun --export=ALL --kill-on-bad-exit=1"
 		f" {shlex.quote( python )} -m torch.distributed.run"
 		f" --nnodes=$SLURM_NNODES"
-		f" --nproc_per_node=1"
+		f" --nproc_per_node=$SLURM_GPUS_ON_NODE"
 		f" --rdzv_id=$SLURM_JOB_ID"
 		f" --rdzv_backend=c10d"
 		f" --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT"
@@ -462,7 +462,15 @@ def train(config, resume_from = None):
 	timestamp = datetime.fromtimestamp( ts )
 	tr["output_dir"] = config["root_prefix"] + f"cache/quietstar/{ts}"
 	tr["optim"] = "adamw_torch_fused" if torch.cuda.is_available() or torch.backends.mps.is_available() else "adamw_torch"
-	tr["gradient_accumulation_steps"] = effective_batch_size // tr["per_device_train_batch_size"]
+	# torchrun sets WORLD_SIZE; default to 1 for local single-process runs.
+	world_size = int( os.environ.get( "WORLD_SIZE", "1" ) )
+	per_step_batch = tr["per_device_train_batch_size"] * world_size
+	if effective_batch_size % per_step_batch != 0:
+		raise ValueError(
+			f"effective_batch_size={effective_batch_size} is not divisible by"
+			f" per_device_train_batch_size={tr['per_device_train_batch_size']} * world_size={world_size}"
+		)
+	tr["gradient_accumulation_steps"] = effective_batch_size // per_step_batch
 	tr["per_device_eval_batch_size"] = tr["per_device_train_batch_size"]
 	tr["run_name"] = f"n{config['thought_model']['n_thoughts']}_d{config['thought_model']['thought_depth']}_la{config['thought_model']['look_ahead']}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}"
 
