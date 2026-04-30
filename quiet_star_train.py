@@ -32,6 +32,10 @@ SLURM_TEMPLATE = """\
 
 job_name: qstar
 partition: gpu
+# For multi-node DDP, bump `nodes`. Keep `ntasks_per_node: 1` — torchrun
+# spawns workers itself, so one srun task per node is correct. Set `gres`
+# to the GPUs available per node; `--nproc_per_node` is derived from
+# $SLURM_GPUS_ON_NODE at launch.
 nodes: 1
 ntasks_per_node: 1
 gres: "gpu:1"
@@ -116,7 +120,7 @@ def submit_slurm( slurm_config_path, train_args ):
 		f"srun --export=ALL --kill-on-bad-exit=1"
 		f" {shlex.quote( python )} -m torch.distributed.run"
 		f" --nnodes=$SLURM_NNODES"
-		f" --nproc_per_node=1"
+		f" --nproc_per_node=${{SLURM_GPUS_ON_NODE:-1}}"
 		f" --rdzv_id=$SLURM_JOB_ID"
 		f" --rdzv_backend=c10d"
 		f" --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT"
@@ -141,7 +145,7 @@ def submit_slurm( slurm_config_path, train_args ):
 	# Set up distributed env vars
 	slurm.add_cmd(
 		'export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)' )
-	slurm.add_cmd( 'export MASTER_PORT=${MASTER_PORT:-29500}' )
+	slurm.add_cmd( 'export MASTER_PORT=${MASTER_PORT:-$((20000 + SLURM_JOB_ID % 10000))}' )
 
 	# Submit
 	job_id = slurm.sbatch( train_cmd )
@@ -365,7 +369,8 @@ def train(config, resume_from = None):
 	timestamp = datetime.fromtimestamp( ts )
 	tr["output_dir"] = config["root_prefix"] + f"cache/quietstar/{ts}"
 	tr["optim"] = "adamw_torch_fused" if torch.cuda.is_available() or torch.backends.mps.is_available() else "adamw_torch"
-	tr["gradient_accumulation_steps"] = effective_batch_size // tr["per_device_train_batch_size"]
+	world_size = int( os.environ.get( "WORLD_SIZE", 1 ) )
+	tr["gradient_accumulation_steps"] = effective_batch_size // (tr["per_device_train_batch_size"] * world_size)
 	tr["per_device_eval_batch_size"] = tr["per_device_train_batch_size"]
 	tr["run_name"] = f"n{config['thought_model']['n_thoughts']}_d{config['thought_model']['thought_depth']}_la{config['thought_model']['look_ahead']}_{timestamp.year:04d}{timestamp.month:02d}{timestamp.day:02d}_{timestamp.hour:02d}{timestamp.minute:02d}{timestamp.second:02d}"
 
