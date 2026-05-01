@@ -508,10 +508,41 @@ def submit_slurm( slurm_config_path, train_args ):
 	slurm.add_cmd( 'export MASTER_PORT=${MASTER_PORT:-29500}' )
 
 	# Submit
+	dispatch_cwd = os.getcwd()
 	job_id = slurm.sbatch( train_cmd )
 	print( f"Submitted Slurm job {job_id}" )
 	print( f"Worktree: {worktree_path}" )
 	print( f"Commit: {head_commit[ :8 ]}" )
+
+	if getattr( train_args, "follow", False ):
+		_follow_slurm_log( slurm_params, job_id, dispatch_cwd )
+
+
+def _follow_slurm_log( slurm_params, job_id, dispatch_cwd ):
+	"""Wait for the slurm log to appear and exec a pager on it. Pager command
+	comes from $QUIET_STAR_FOLLOW_PAGER (default `less +F`); falls back to
+	`tail -f` if the pager isn't on PATH (less isn't always installed). Not
+	$PAGER — that's for static reading and rarely set up for live files."""
+	pattern = slurm_params.get( "output", "slurm-%j.out" )
+	log_path = (
+		pattern
+		.replace( "%j", str( job_id ) )
+		.replace( "%x", str( slurm_params.get( "job_name", "qstar" ) ) ) )
+	if not os.path.isabs( log_path ):
+		log_path = os.path.join( dispatch_cwd, log_path )
+	log_path = os.path.abspath( log_path )
+	print( f"Waiting for {log_path}...", file = sys.stderr )
+	while not os.path.exists( log_path ):
+		time.sleep( 2 )
+
+	pager_argv = shlex.split( os.environ.get( "QUIET_STAR_FOLLOW_PAGER", "less +F" ) )
+	if shutil.which( pager_argv[ 0 ] ) is None:
+		print(
+			f"[follow] {pager_argv[ 0 ]} not on PATH, falling back to `tail -f`",
+			file = sys.stderr )
+		pager_argv = [ "tail", "-f" ]
+	pager_argv.append( log_path )
+	os.execvp( pager_argv[ 0 ], pager_argv )
 
 
 _interrupted = False
@@ -927,6 +958,8 @@ if __name__ == "__main__":
 		help = "Submit to Slurm using this config file instead of running locally" )
 	train_parser.add_argument( "--root-prefix", metavar = "PATH", default = None,
 		help = "Root path for cache/output dirs; overrides WANDB_CACHE_DIR and config root_prefix" )
+	train_parser.add_argument( "--follow", "-f", action = "store_true",
+		help = "After --slurm submit, exec `less +F` on the job's log file." )
 
 	upload_parser = subparsers.add_parser( "upload-pending",
 		help = "Upload checkpoints flagged by graceful-stop manifests" )
