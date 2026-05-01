@@ -657,6 +657,18 @@ def train(config, resume_from = None):
 	# pass and every broadcast_forward in the depth loop / look-ahead pass.
 	_compile_mode = os.environ.get( "QUIET_STAR_COMPILE" ) or None
 
+	# QUIET_STAR_COMPILE_FULL takes precedence over QUIET_STAR_COMPILE: when set,
+	# the entire training_forward gets compiled end-to-end (one compiled call
+	# per micro-batch instead of one per LM forward). Letting Dynamo see the
+	# full graph also dodges the reduce-overhead "fan-out then collect"
+	# fast-path-fail (multiple inner-LM forwards per single backward).
+	# Skips the inner-LM compile when set — Dynamo inlines lm_model.model.forward
+	# into the outer graph, which gives it more visibility for optimization
+	# than wrapping a torch.compile around an already-compiled inner.
+	_compile_mode_full = os.environ.get( "QUIET_STAR_COMPILE_FULL" ) or None
+	if _compile_mode_full is not None:
+		_compile_mode = None
+
 	@contextlib.contextmanager
 	def cm_memory():
 		if not _memory_profile:
@@ -1028,6 +1040,15 @@ def train(config, resume_from = None):
 
 		model_config = ThoughtModelConfig( **params )
 		model = AutoModel.from_config( model_config, lm_model = lm_model )
+
+		# Plumb full-compile mode to ThoughtModel's training_forward dispatcher.
+		# Lazy compile: first training_forward call runs eager (warming einx
+		# pattern caches), subsequent calls use the compiled implementation.
+		if _compile_mode_full is not None:
+			print(
+				f"[compile] training_forward will compile after first eager call (mode={_compile_mode_full!r})",
+				file = sys.stderr )
+			model._compile_mode_full = _compile_mode_full
 
 		model.train()
 		return model

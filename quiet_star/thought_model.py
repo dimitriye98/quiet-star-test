@@ -420,14 +420,77 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 			return None, hidden
 
+	def _ensure_static_caches( self, b, L, device ):
+		"""Lazy-allocate the two StaticCaches on first training_forward call.
+		Subsequent calls reuse the buffers — every position is overwritten
+		by the prior pass + K/V copy + depth loop + look-ahead, so previous-
+		call state doesn't leak into the current call's attention. Cache
+		allocation has to live outside any torch.compile region because
+		StaticCache.__init__ calls torch._dynamo.mark_static_address, which
+		Dynamo refuses to trace."""
+		if getattr( self, "_prior_cache", None ) is not None:
+			return
+		n = self.n_thoughts
+		l = L - self.look_ahead
+		d = 2 + self.thought_depth + self.look_ahead
+		text_config = self.lm_model.config
+		dtype = self.lm_model.dtype
+		self._prior_cache = StaticCache(
+			config = text_config,
+			max_batch_size = b,
+			max_cache_len = L - 1,
+			dtype = dtype,
+			device = device,
+		)
+		self._broadcast_cache = StaticCache(
+			config = text_config,
+			max_batch_size = b * n,
+			max_cache_len = d * l,
+			dtype = dtype,
+			device = device,
+		)
+
 	def training_forward( self, input_ids, labels, padding_mask, thought_temperature, *, kv_cache = None ):
-		# kv_cache argument is retained for API compatibility but unused — we
-		# allocate two StaticCaches internally so all shapes are constant for
-		# torch.compile. The thought-loop attention mask is sized for d*l KV
-		# positions; with StaticCache the cache tensor returned to attention
-		# is also d*l (zero-filled at unwritten slots, masked out by -inf in
-		# the additive mask), so shapes match exactly without any per-call
-		# reshape or append.
+		"""Dispatcher for end-to-end torch.compile of the training forward.
+
+		Allocates the two StaticCaches on first call (outside the compile
+		region — Dynamo can't trace StaticCache.__init__'s mark_static_address
+		call), then routes to _training_forward_impl. Under
+		QUIET_STAR_COMPILE_FULL, the first call runs the eager impl to warm
+		up einx pattern caches (einx generates and caches torch ops the
+		first time a pattern is seen with a given shape; Dynamo can't trace
+		through the cache-miss path), and subsequent calls use the compiled
+		wrapper. When _compile_mode_full is None, this is just a thin
+		wrapper around _training_forward_impl that handles cache allocation."""
+		self._ensure_static_caches( input_ids.shape[ 0 ], input_ids.shape[ 1 ], input_ids.device )
+		impl_kwargs = dict(
+			kv_cache = kv_cache,
+			prior_cache = self._prior_cache,
+			broadcast_cache = self._broadcast_cache,
+		)
+		if getattr( self, "_compile_mode_full", None ) is None:
+			return self._training_forward_impl( input_ids, labels, padding_mask, thought_temperature, **impl_kwargs )
+		if not getattr( self, "_einx_warmed", False ):
+			self._einx_warmed = True
+			return self._training_forward_impl( input_ids, labels, padding_mask, thought_temperature, **impl_kwargs )
+		if getattr( self, "_compiled_training_forward", None ) is None:
+			self._compiled_training_forward = t.compile(
+				self._training_forward_impl,
+				mode = self._compile_mode_full,
+			)
+		return self._compiled_training_forward( input_ids, labels, padding_mask, thought_temperature, **impl_kwargs )
+
+	def _training_forward_impl(
+			self, input_ids, labels, padding_mask, thought_temperature,
+			*, kv_cache = None, prior_cache = None, broadcast_cache = None ):
+		# kv_cache argument is retained for API compatibility but unused. The
+		# two StaticCaches are allocated outside this function (in the
+		# training_forward dispatcher) and passed in — Dynamo refuses to
+		# trace StaticCache.__init__'s mark_static_address call. The thought-
+		# loop attention mask is sized for d*l KV positions; with StaticCache
+		# the cache tensor returned to attention is also d*l (zero-filled at
+		# unwritten slots, masked out by -inf in the additive mask), so
+		# shapes match exactly without any per-call reshape or append.
 		assert input_ids.device == padding_mask.device
 		b, L = input_ids.shape
 		n = self.n_thoughts
@@ -436,26 +499,6 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		text_config = self.lm_model.config
 		dtype = self.lm_model.dtype
 		device = input_ids.device
-
-		# Prior cache: depth-0 K/V for the L-1 input prefix that naive_forward
-		# operates on (input_ids[:, :-1] for teacher-forced next-token prediction).
-		prior_cache = StaticCache(
-			config = text_config,
-			max_batch_size = b,
-			max_cache_len = L - 1,
-			dtype = dtype,
-			device = device,
-		)
-		# Broadcast cache: full thought-loop layout at b*n batch. d*l positions
-		# cover input prefix (1 layer) + start_tok + thought_depth + end_tok +
-		# look_ahead-1 target layers.
-		broadcast_cache = StaticCache(
-			config = text_config,
-			max_batch_size = b * n,
-			max_cache_len = d * l,
-			dtype = dtype,
-			device = device,
-		)
 
 		# Prior LM forward — populates prior_cache at positions [0, L-1).
 		cache_pos_prior = t.arange( L - 1, device = device )
