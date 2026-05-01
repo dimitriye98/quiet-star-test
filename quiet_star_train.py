@@ -824,6 +824,21 @@ def train(config, resume_from = None):
 				m.sync_thought_embeddings()
 			return control
 
+	class OptimizerProbeCallback( TrainerCallback ):
+		"""Print the actual optimizer class chain at train start. DeepSpeed
+		wraps its ZeRO optimizer around the underlying one (DeepSpeedCPUAdam,
+		FusedAdam, or torch AdamW); the wrapper exposes `.optimizer`. Walking
+		that chain confirms which leaf implementation is actually running."""
+		def on_train_begin( self, args, state, control, optimizer = None, **kwargs ):
+			opt = optimizer
+			chain = []
+			seen = set()
+			while opt is not None and id( opt ) not in seen:
+				seen.add( id( opt ) )
+				chain.append( f"{opt.__class__.__module__}.{opt.__class__.__name__}" )
+				opt = getattr( opt, "optimizer", None )
+			print( f"[opt-check] optimizer chain: {' -> '.join( chain )}", file = sys.stderr )
+
 	class TorchProfilerCallback( TrainerCallback ):
 		"""Opt-in torch.profiler wrapper gated on QUIET_STAR_TORCH_PROFILE=1.
 		Schedule wait=2 / warmup=1 / active=1 / repeat=1: skips two optimizer
@@ -1055,7 +1070,7 @@ def train(config, resume_from = None):
 	training_args = TrainingArguments( **tr )
 
 	graceful_cb = GracefulStopCallback()
-	cb_list = [ ConfigArtifactCallback( config ), graceful_cb, SyncEmbeddingsCallback() ]
+	cb_list = [ ConfigArtifactCallback( config ), graceful_cb, SyncEmbeddingsCallback(), OptimizerProbeCallback() ]
 	if _torch_profile:
 		cb_list.append( TorchProfilerCallback() )
 	trainer = TrainerWithCache(

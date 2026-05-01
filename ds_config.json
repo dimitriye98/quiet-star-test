@@ -2,7 +2,14 @@
   "bf16": { "enabled": "auto" },
   "optimizer": {
     "type": "AdamW",
-    "params": { "lr": "auto", "betas": "auto", "eps": "auto", "weight_decay": "auto" }
+    "params": {
+      "lr": "auto",
+      "betas": "auto",
+      "eps": "auto",
+      "weight_decay": "auto",
+      "torch_adam": false,
+      "adam_w_mode": true
+    }
   },
   "zero_optimization": {
     "stage": 2,
