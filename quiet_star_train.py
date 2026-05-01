@@ -266,10 +266,20 @@ cpus_per_task: 4
 # and an `.auto_resume` marker (written only on SIGTERM, not SIGINT/Ctrl-C)
 # triggers automatic resume from the latest local checkpoint.
 
-# Optional bash commands to run before training (e.g. SSH tunnels, module loads).
+# Optional bash commands to run on the head node before training. Env vars
+# exported here propagate to all ranks via srun --export=ALL — put module
+# loads, http_proxy exports, etc. here.
 # setup: |
+#   module load nvhpc
+#   export http_proxy=socks5://localhost:1080
+#   export https_proxy=socks5://localhost:1080
+
+# Optional per-node bash commands, run via `srun --ntasks-per-node=1` so each
+# allocated node executes them once. Env vars set here do NOT propagate to
+# training (those belong in `setup`). Use this for per-node daemons that have
+# to listen on each node's localhost — SOCKS proxies, fuse mounts, etc.
+# per_node_setup: |
 #   ssh -fN -D 1080 proxy-host
-#   export HTTPS_PROXY=socks5://localhost:1080
 
 # Optional follow-on job for uploading checkpoints saved on Slurm preemption.
 # On graceful preempt the handler saves a checkpoint + manifest locally without
@@ -358,6 +368,7 @@ def submit_slurm( slurm_config_path, train_args ):
 	with open( slurm_config_path ) as f:
 		slurm_params = yaml.safe_load( f )
 	setup_script = slurm_params.pop( "setup", None )
+	per_node_setup = slurm_params.pop( "per_node_setup", None )
 	uploader_overrides = slurm_params.pop( "uploader", None )
 	slurm_params.setdefault( "job_name", "qstar" )
 	# Auto-requeue on preemption: Slurm puts the job back in queue with the same
@@ -481,9 +492,18 @@ def submit_slurm( slurm_config_path, train_args ):
 		" fi' EXIT"
 	)
 
-	# Run user-provided setup script (e.g. SSH tunnels, module loads)
+	# Run user-provided head-node setup (env vars propagated to all ranks via
+	# srun --export=ALL).
 	if setup_script is not None:
 		slurm.add_cmd( setup_script )
+
+	# Run per-node setup once per allocated node (e.g. starting a SOCKS proxy
+	# that has to listen on each node's localhost). Env vars set here don't
+	# propagate to training — those belong in `setup` above.
+	if per_node_setup is not None:
+		slurm.add_cmd(
+			"srun --nodes=$SLURM_NNODES --ntasks-per-node=1 bash -c "
+			+ shlex.quote( per_node_setup ) )
 
 	# Set up distributed env vars
 	slurm.add_cmd(
