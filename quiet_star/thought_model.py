@@ -670,11 +670,44 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			+ self.beta_thought * thought_loss + self.beta_stability * prior_cross_entropy_loss)
 		loss = t.nanmean( loss )
 
-		# Mixer diagnostics (no_grad, logging only)
+		# Return raw per-sample tensors. Reduction to scalars (with .item()
+		# syncs and python conditionals on tensor values) happens in
+		# compute_stats_from_raw on the trainer side, keeping training_forward
+		# pure-tensor and compile-friendly.
+		raw = {
+			"loss": loss,
+			"mixed_cross_entropy_loss": mixed_cross_entropy_loss,
+			"prior_cross_entropy_loss": prior_cross_entropy_loss,
+			"post_cross_entropy_loss": post_cross_entropy_loss,
+			"thought_loss": thought_loss,
+			"alpha": alpha,
+			"r": r,
+			"advantage": advantage,
+			"thought_entropy": thought_entropy,
+		}
+
+		return loss, None, raw
+
+	@staticmethod
+	def compute_stats_from_raw( raw ):
+		"""Reduce raw per-sample tensors from training_forward into a dict of
+		scalars suitable for self.log(). Lives outside the forward so the
+		forward stays compile-friendly — every .item() and every python
+		conditional on a tensor value is here, not in the compute graph."""
+		mixed_ce = raw[ "mixed_cross_entropy_loss" ]
+		prior_ce = raw[ "prior_cross_entropy_loss" ]
+		post_ce = raw[ "post_cross_entropy_loss" ]
+		thought_loss = raw[ "thought_loss" ]
+		alpha = raw[ "alpha" ]
+		r = raw[ "r" ]
+		advantage = raw[ "advantage" ]
+		thought_entropy = raw[ "thought_entropy" ]
+		loss = raw[ "loss" ]
+
 		with t.no_grad():
 			pooled_alpha = x.reduce( "b n [d] l a", alpha, op = t.nanmean ).squeeze( -1 )
-			post_advantage = prior_cross_entropy_loss - post_cross_entropy_loss
-			valid_mask = ~(post_cross_entropy_loss.isnan() | prior_cross_entropy_loss.isnan())
+			post_advantage = prior_ce - post_ce
+			valid_mask = ~(post_ce.isnan() | prior_ce.isnan())
 			alpha_masked = pooled_alpha.where( valid_mask, t.tensor( float( "nan" ), device = pooled_alpha.device ) )
 			adv_masked = post_advantage.where( valid_mask, t.tensor( float( "nan" ), device = post_advantage.device ) )
 			weighted_adv_den = t.nansum( alpha_masked )
@@ -683,38 +716,36 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				if weighted_adv_den > 0 else float( "nan" )
 			)
 
-		stats = {
-			"mixed_cross_entropy_avg": t.nanmean( mixed_cross_entropy_loss ).item(),
-			"mixed_cross_entropy_min": nanmin( mixed_cross_entropy_loss ).item(),
-			"mixed_cross_entropy_max": nanmax( mixed_cross_entropy_loss ).item(),
-			"prior_cross_entropy_avg": t.nanmean( prior_cross_entropy_loss ).item(),
-			"prior_cross_entropy_min": nanmin( prior_cross_entropy_loss ).item(),
-			"prior_cross_entropy_max": nanmax( prior_cross_entropy_loss ).item(),
-			"posterior_cross_entropy_avg": t.nanmean( post_cross_entropy_loss ).item(),
-			"posterior_cross_entropy_min": nanmin( post_cross_entropy_loss ).item(),
-			"posterior_cross_entropy_max": nanmax( post_cross_entropy_loss ).item(),
-			"thought_loss_avg": t.nanmean( thought_loss ).item(),
-			"thought_loss_min": nanmin( thought_loss ).item(),
-			"thought_loss_max": nanmax( thought_loss ).item(),
-			"alpha_avg": t.nanmean( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
-			"alpha_min": nanmin( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
-			"alpha_max": nanmax( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
-			"r_avg": t.nanmean( r ).item(),
-			"r_min": nanmin( r ).item(),
-			"r_max": nanmax( r ).item(),
-			"advantage_avg": t.nanmean( advantage ).item(),
-			"advantage_min": nanmin( advantage ).item(),
-			"advantage_max": nanmax( advantage ).item(),
-			"thought_entropy_avg": t.nanmean( thought_entropy ).item(),
-			"thought_entropy_min": nanmin( thought_entropy ).item(),
-			"thought_entropy_max": nanmax( thought_entropy ).item(),
-			"corr_post_prior_ce": nancorr( post_cross_entropy_loss, prior_cross_entropy_loss ).item(),
-			"corr_alpha_post_advantage": nancorr( pooled_alpha, post_advantage ).item(),
-			"alpha_weighted_post_advantage": weighted_post_advantage,
-			"loss": loss.item()
-		}
-
-		return loss, None, stats
+			return {
+				"mixed_cross_entropy_avg": t.nanmean( mixed_ce ).item(),
+				"mixed_cross_entropy_min": nanmin( mixed_ce ).item(),
+				"mixed_cross_entropy_max": nanmax( mixed_ce ).item(),
+				"prior_cross_entropy_avg": t.nanmean( prior_ce ).item(),
+				"prior_cross_entropy_min": nanmin( prior_ce ).item(),
+				"prior_cross_entropy_max": nanmax( prior_ce ).item(),
+				"posterior_cross_entropy_avg": t.nanmean( post_ce ).item(),
+				"posterior_cross_entropy_min": nanmin( post_ce ).item(),
+				"posterior_cross_entropy_max": nanmax( post_ce ).item(),
+				"thought_loss_avg": t.nanmean( thought_loss ).item(),
+				"thought_loss_min": nanmin( thought_loss ).item(),
+				"thought_loss_max": nanmax( thought_loss ).item(),
+				"alpha_avg": t.nanmean( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+				"alpha_min": nanmin( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+				"alpha_max": nanmax( x.reduce( "b n [d] l a", alpha, op = t.nanmean ) ).item(),
+				"r_avg": t.nanmean( r ).item(),
+				"r_min": nanmin( r ).item(),
+				"r_max": nanmax( r ).item(),
+				"advantage_avg": t.nanmean( advantage ).item(),
+				"advantage_min": nanmin( advantage ).item(),
+				"advantage_max": nanmax( advantage ).item(),
+				"thought_entropy_avg": t.nanmean( thought_entropy ).item(),
+				"thought_entropy_min": nanmin( thought_entropy ).item(),
+				"thought_entropy_max": nanmax( thought_entropy ).item(),
+				"corr_post_prior_ce": nancorr( post_ce, prior_ce ).item(),
+				"corr_alpha_post_advantage": nancorr( pooled_alpha, post_advantage ).item(),
+				"alpha_weighted_post_advantage": weighted_post_advantage,
+				"loss": loss.item()
+			}
 
 	@classmethod
 	def truncate_cache( cls, kv_cache, l ):

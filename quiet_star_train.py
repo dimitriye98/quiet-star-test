@@ -716,7 +716,11 @@ def train(config, resume_from = None):
 			with cm_memory() if torch.cuda.is_available() else contextlib.nullcontext():
 				loss, o = super().compute_loss(
 					model, inputs, return_outputs = True, num_items_in_batch = num_items_in_batch )
-			self.log( o[ 2 ] )
+			# training_forward returns raw per-sample tensors so the forward
+			# stays compile-friendly; reduce to scalars here, on the trainer
+			# side, where .item() syncs and python conditionals are fine.
+			m = model.module if hasattr( model, "module" ) else model
+			self.log( m.compute_stats_from_raw( o[ 2 ] ) )
 			return (loss, o) if return_outputs else loss
 
 	class ConfigArtifactCallback( TrainerCallback ):
