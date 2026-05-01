@@ -444,6 +444,12 @@ def submit_slurm( slurm_config_path, train_args ):
 		else:
 			uploader_setup = setup_script
 		uploader_flags = dict( slurm_params )
+		# Uploader is conceptually single-node single-task — the main job's
+		# nodes/ntasks-per-node/mem-per-cpu/etc. are sized for distributed
+		# training and don't make sense for a one-shot wandb upload. Reset to
+		# minimal defaults; the user can override via uploader_overrides.
+		uploader_flags[ "nodes" ] = 1
+		uploader_flags.pop( "ntasks_per_node", None )
 		for k, v in uploader_overrides.items():
 			if v is None:
 				uploader_flags.pop( k, None )
