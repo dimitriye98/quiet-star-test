@@ -584,6 +584,7 @@ def train(config, resume_from = None):
 		DataCollator, PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin, \
 		EvalPrediction, TrainerCallback, TrainingArguments, Trainer
 	from transformers.integrations import WandbCallback
+	from transformers.trainer_callback import ProgressCallback, PrinterCallback
 	from liger_kernel.transformers import AutoLigerKernelForCausalLM
 	from datasets import load_dataset
 	from quiet_star.eval_helpers import preprocess_function
@@ -966,6 +967,11 @@ def train(config, resume_from = None):
 			break
 	else:
 		trainer.callback_handler.add_callback( wandb_cb )
+
+	# Drop the console progress/printer callbacks — wandb has the metrics, and
+	# tqdm + per-step dict prints just clog the Slurm log.
+	trainer.remove_callback( ProgressCallback )
+	trainer.remove_callback( PrinterCallback )
 
 	resume_checkpoint = None
 	if resume_from is not None:
