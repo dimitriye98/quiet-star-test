@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import partial
 
 from quiet_star.config import DEFAULT_CONFIG, resolve_torch_dtype, save_config, load_config
@@ -585,6 +585,31 @@ def train(config, resume_from = None):
 		EvalPrediction, TrainerCallback, TrainingArguments, Trainer
 	from transformers.integrations import WandbCallback
 	from transformers.trainer_callback import ProgressCallback, PrinterCallback
+
+	# Route tqdm progress through Python logging in non-tty mode so the Slurm
+	# log gets nice periodic progress lines instead of CR-laden tty-style
+	# updates. Monkey-patch must happen before HF's ProgressCallback is
+	# constructed (it captures the module-level tqdm at instantiation time).
+	try:
+		from tqdm_loggable.auto import tqdm as _loggable_tqdm
+		from tqdm_loggable.tqdm_logging import tqdm_logging as _tqdm_logging
+		import logging
+		import transformers.trainer_callback as _tc_mod
+		_tc_mod.tqdm = _loggable_tqdm
+		_tqdm_logging.set_log_rate( timedelta( seconds = 30 ) )
+		# Give tqdm_loggable its own handler so its INFO-level output is visible
+		# regardless of root logger configuration; propagate=False avoids
+		# double-emitting if a root handler is also present.
+		_tqdm_logger = logging.getLogger( "tqdm_loggable" )
+		_tqdm_logger.setLevel( logging.INFO )
+		if not _tqdm_logger.handlers:
+			_h = logging.StreamHandler( sys.stderr )
+			_h.setFormatter( logging.Formatter( "%(asctime)s %(message)s" ) )
+			_tqdm_logger.addHandler( _h )
+			_tqdm_logger.propagate = False
+		_tqdm_loggable_ok = True
+	except ImportError:
+		_tqdm_loggable_ok = False
 	from liger_kernel.transformers import AutoLigerKernelForCausalLM
 	from datasets import load_dataset
 	from quiet_star.eval_helpers import preprocess_function
@@ -968,10 +993,29 @@ def train(config, resume_from = None):
 	else:
 		trainer.callback_handler.add_callback( wandb_cb )
 
-	# Drop the console progress/printer callbacks — wandb has the metrics, and
-	# tqdm + per-step dict prints just clog the Slurm log.
-	trainer.remove_callback( ProgressCallback )
+	# PrinterCallback dumps per-step metric dicts; wandb has them, drop it.
 	trainer.remove_callback( PrinterCallback )
+
+	# Replace ProgressCallback with a quiet subclass that suppresses on_log
+	# (same metric-dict spam as PrinterCallback). Combined with the
+	# tqdm-loggable monkey patch above, the bar still emits periodic progress
+	# lines via Python logging — just without the per-step stats noise. If
+	# tqdm-loggable isn't installed, drop the progress bar entirely (regular
+	# tqdm in a non-tty Slurm log produces a wall of CR-laden garbage).
+	class QuietProgressCallback( ProgressCallback ):
+		def on_log( self, args, state, control, logs = None, **kwargs ):
+			return
+	if _tqdm_loggable_ok:
+		for i, cb in enumerate( trainer.callback_handler.callbacks ):
+			if type( cb ) is ProgressCallback:
+				trainer.callback_handler.callbacks[ i ] = QuietProgressCallback()
+				break
+	else:
+		print(
+			"[setup] tqdm-loggable not installed; dropping progress bar. "
+			"`pip install tqdm-loggable` for log-friendly progress.",
+			file = sys.stderr )
+		trainer.remove_callback( ProgressCallback )
 
 	resume_checkpoint = None
 	if resume_from is not None:
