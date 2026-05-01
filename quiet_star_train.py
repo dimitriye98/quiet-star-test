@@ -75,28 +75,60 @@ def config_from_wandb_checkpoint( resume_from ):
 	raise ValueError( f"No config artifact found for run {run.name}" )
 
 
+def _has_checkpoint_subdirs( path ):
+	if not os.path.isdir( path ):
+		return False
+	for entry in os.listdir( path ):
+		if entry.startswith( "checkpoint-" ) and os.path.isdir( os.path.join( path, entry ) ):
+			try:
+				int( entry.split( "-" )[ 1 ] )
+				return True
+			except ValueError:
+				continue
+	return False
+
+
+def _latest_checkpoint( output_dir ):
+	candidates = []
+	for entry in os.listdir( output_dir ):
+		if entry.startswith( "checkpoint-" ) and os.path.isdir( os.path.join( output_dir, entry ) ):
+			try:
+				candidates.append( ( int( entry.split( "-" )[ 1 ] ), entry ) )
+			except ValueError:
+				continue
+	if not candidates:
+		raise ValueError( f"No checkpoint-N subdirs in {output_dir}" )
+	return os.path.join( output_dir, max( candidates )[ 1 ] )
+
+
 def _resolve_local_resume( path ):
 	"""Resolve a local --resume path to (checkpoint_dir, output_dir, run_info).
-	Accepts either a `checkpoint-N` dir or its parent `output_dir` (in which
-	case the latest checkpoint-N is selected). Recovers the wandb run id from
-	the durable `wandb_run.json` sidecar written at training start, falling
-	back to a `pending_upload.json` manifest if the sidecar is missing."""
+	Accepts:
+	- a `checkpoint-N` dir,
+	- an `output_dir` (parent of checkpoint-N, has `wandb_run.json`),
+	- any ancestor (e.g. a worktree); the most recently modified output_dir
+	  found beneath it is selected.
+	Recovers the wandb run id from the durable `wandb_run.json` sidecar
+	written at training start, falling back to a `pending_upload.json`
+	manifest if the sidecar is missing."""
 	path = os.path.abspath( path )
 	if os.path.exists( os.path.join( path, "trainer_state.json" ) ):
 		ckpt_dir = path
 		output_dir = os.path.dirname( path )
-	else:
-		candidates = []
-		for entry in os.listdir( path ):
-			if entry.startswith( "checkpoint-" ) and os.path.isdir( os.path.join( path, entry ) ):
-				try:
-					candidates.append( ( int( entry.split( "-" )[ 1 ] ), entry ) )
-				except ValueError:
-					continue
-		if not candidates:
-			raise ValueError( f"No checkpoint-N subdirs found in {path}" )
-		ckpt_dir = os.path.join( path, max( candidates )[ 1 ] )
+	elif os.path.exists( os.path.join( path, "wandb_run.json" ) ) or _has_checkpoint_subdirs( path ):
+		ckpt_dir = _latest_checkpoint( path )
 		output_dir = path
+	else:
+		# Walk for output_dirs (marked by wandb_run.json + checkpoint-N subdirs).
+		output_dirs = []
+		for root, dirs, files in os.walk( path ):
+			if "wandb_run.json" in files and _has_checkpoint_subdirs( root ):
+				output_dirs.append( root )
+				dirs[ : ] = []  # don't recurse into output_dirs
+		if not output_dirs:
+			raise ValueError( f"No resumable training output_dir found under {path}" )
+		output_dir = max( output_dirs, key = lambda d: os.path.getmtime( d ) )
+		ckpt_dir = _latest_checkpoint( output_dir )
 
 	sidecar = os.path.join( output_dir, "wandb_run.json" )
 	if os.path.exists( sidecar ):
@@ -153,16 +185,13 @@ def submit_uploader( pending_dir ):
 
 
 def run_uploader_job():
-	"""Runs as the uploader sbatch job. Uploads the pending checkpoint(s) then
-	removes the worktree. Reads pending dir + worktree paths from env vars set
-	by submit_uploader's --export=ALL."""
+	"""Runs as the uploader sbatch job. Uploads the pending checkpoint(s) and
+	exits. The worktree is intentionally left alone — auto-resume needs it, and
+	cleanup only happens when the *training* job exits cleanly (rc=0 trap branch
+	in submit_slurm). Reads pending dir from env set via submit_uploader's
+	--export=ALL."""
 	pending = os.environ[ "QUIET_STAR_PENDING_DIR" ]
-	worktree = os.environ[ "QUIET_STAR_WORKTREE_PATH" ]
-	repo_root = os.environ[ "QUIET_STAR_REPO_ROOT" ]
 	upload_pending( pending )
-	subprocess.run(
-		[ "git", "-C", repo_root, "worktree", "remove", "--force", worktree ],
-		check = True )
 
 
 def upload_pending( output_dir ):
@@ -248,39 +277,71 @@ cpus_per_task: 4
 """
 
 
+def _worktree_for_path( path, repo_root ):
+	"""If path lies inside a worktree under repo_root/.worktrees/, return the
+	worktree's top-level dir; otherwise None."""
+	abspath = os.path.realpath( os.path.abspath( path ) )
+	worktrees_root = os.path.realpath( os.path.join( repo_root, ".worktrees" ) )
+	if not abspath.startswith( worktrees_root + os.sep ):
+		return None
+	rel = os.path.relpath( abspath, worktrees_root )
+	return os.path.join( worktrees_root, rel.split( os.sep )[ 0 ] )
+
+
 def submit_slurm( slurm_config_path, train_args ):
-	"""Create a git worktree from HEAD and submit a Slurm job."""
+	"""Create (or reuse) a git worktree and submit a Slurm job. If --resume
+	points inside an existing `.worktrees/<job-X>/` worktree, that worktree is
+	reused (no fresh checkout) and the clean-tree check is skipped — the resume
+	state is what matters, not the current state of the user's main checkout."""
 	import yaml
 	from simple_slurm import Slurm
 
-	# Ensure working tree is clean
-	result = subprocess.run(
-		[ "git", "status", "--porcelain", "-uno" ],
-		capture_output = True, text = True, check = True
-	)
-	if result.stdout.strip():
-		print( "Error: uncommitted changes. Commit before submitting.", file = sys.stderr )
-		sys.exit( 1 )
-
-	# Create worktree from HEAD
 	repo_root = subprocess.run(
 		[ "git", "rev-parse", "--show-toplevel" ],
 		capture_output = True, text = True, check = True
 	).stdout.strip()
 
-	ts = int( time.time() )
-	worktree_path = os.path.join( repo_root, ".worktrees", f"job-{ts}" )
-	os.makedirs( os.path.dirname( worktree_path ), exist_ok = True )
+	# Detect existing worktree to reuse, based on --resume path
+	existing_worktree = None
+	if train_args.resume is not None and os.path.isdir( train_args.resume ):
+		existing_worktree = _worktree_for_path( train_args.resume, repo_root )
 
-	head_commit = subprocess.run(
-		[ "git", "rev-parse", "HEAD" ],
-		capture_output = True, text = True, check = True
-	).stdout.strip()
+	if existing_worktree is None:
+		# Fresh worktree: require clean tree so the new checkout captures HEAD intent
+		result = subprocess.run(
+			[ "git", "status", "--porcelain", "-uno" ],
+			capture_output = True, text = True, check = True
+		)
+		if result.stdout.strip():
+			print( "Error: uncommitted changes. Commit before submitting.", file = sys.stderr )
+			sys.exit( 1 )
 
-	subprocess.run(
-		[ "git", "worktree", "add", "--detach", worktree_path, head_commit ],
-		check = True
-	)
+		ts = int( time.time() )
+		worktree_path = os.path.join( repo_root, ".worktrees", f"job-{ts}" )
+		os.makedirs( os.path.dirname( worktree_path ), exist_ok = True )
+
+		head_commit = subprocess.run(
+			[ "git", "rev-parse", "HEAD" ],
+			capture_output = True, text = True, check = True
+		).stdout.strip()
+
+		subprocess.run(
+			[ "git", "worktree", "add", "--detach", worktree_path, head_commit ],
+			check = True
+		)
+	else:
+		worktree_path = existing_worktree
+		head_commit = subprocess.run(
+			[ "git", "-C", worktree_path, "rev-parse", "HEAD" ],
+			capture_output = True, text = True, check = True
+		).stdout.strip()
+		print(
+			f"[submit_slurm] Reusing worktree {worktree_path} (HEAD={head_commit[ :8 ]})",
+			file = sys.stderr )
+		# Clear any stale graceful-stop sentinel from a prior job in this worktree.
+		stale_sentinel = os.path.join( worktree_path, _PENDING_SENTINEL )
+		if os.path.exists( stale_sentinel ):
+			os.remove( stale_sentinel )
 
 	# Load slurm config and build Slurm object
 	with open( slurm_config_path ) as f:
@@ -401,9 +462,10 @@ def submit_slurm( slurm_config_path, train_args ):
 	# reference them by $VAR (single-quote-safe) without embedding shlex-quoted
 	# strings inside the trap's '...' body.
 	# Trap branches:
-	# - sentinel present: invoke `submit-uploader` (Python) which submits the
-	#   uploader sbatch job. Worktree is preserved; uploader cleans it up.
-	# - rc==0, no sentinel: normal completion → remove worktree.
+	# - sentinel present (graceful preempt): submit the uploader, preserve the
+	#   worktree so the next requeue / resume can pick it up. The uploader job
+	#   doesn't touch the worktree.
+	# - rc==0, no sentinel: training completed cleanly → remove worktree.
 	# - rc!=0, no sentinel: real failure → preserve worktree for inspection.
 	sentinel_path = os.path.join( worktree_path, _PENDING_SENTINEL )
 	slurm.add_cmd( f"cd {shlex.quote( worktree_path )}" )
