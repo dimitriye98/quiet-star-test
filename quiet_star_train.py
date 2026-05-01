@@ -859,6 +859,76 @@ def train(config, resume_from = None):
 			artifact.add_dir( output_dir )
 			wandb.run.log_artifact( artifact, aliases = [ name ] )
 
+	def _probe_sdpa_backend( lm_model, *, b_n = 2, q_len = 256, depth = 11 ):
+		# Synthesize Q/K/V matching the depth-loop's worst-case shapes and ask
+		# each SDPA backend whether it accepts our additive mask. HF dispatches
+		# to the most permissive non-erroring backend, so the probe tells us
+		# which path the depth-loop is actually taking — mem-efficient (O(N)
+		# attention activations) vs math (B*H*Q*K materialized scores).
+		from torch.nn.attention import SDPBackend, sdpa_kernel
+
+		cfg = lm_model.config
+		n_heads = cfg.num_attention_heads
+		n_kv = getattr( cfg, "num_key_value_heads", n_heads )
+		head_dim = cfg.hidden_size // n_heads
+		dtype = next( lm_model.parameters() ).dtype
+		device = next( lm_model.parameters() ).device
+		kv_len = q_len * depth
+
+		q = torch.randn( b_n, n_heads, q_len, head_dim, dtype = dtype, device = device )
+		k = torch.randn( b_n, n_kv, kv_len, head_dim, dtype = dtype, device = device )
+		v = torch.randn( b_n, n_kv, kv_len, head_dim, dtype = dtype, device = device )
+		# HF Mistral's SDPA path expands K/V to n_heads via repeat_kv before
+		# calling SDPA — fused kernels reject mismatched head counts. Replicate
+		# that here so the probe sees the same shapes the real model does.
+		if n_kv != n_heads:
+			repeat = n_heads // n_kv
+			k = k.repeat_interleave( repeat, dim = 1 )
+			v = v.repeat_interleave( repeat, dim = 1 )
+		mask = torch.zeros( b_n, 1, q_len, kv_len, dtype = dtype, device = device )
+		mask[ ..., : kv_len // 2 ] = torch.finfo( dtype ).min
+
+		print(
+			f"[sdpa-probe] q={tuple(q.shape)} kv={tuple(k.shape)} "
+			f"mask={tuple(mask.shape)} dtype={dtype}",
+			file = sys.stderr )
+		for backend, name in [
+			( SDPBackend.FLASH_ATTENTION, "flash" ),
+			( SDPBackend.EFFICIENT_ATTENTION, "mem-efficient" ),
+			( SDPBackend.CUDNN_ATTENTION, "cudnn" ),
+			( SDPBackend.MATH, "math" ),
+		]:
+			torch.cuda.reset_peak_memory_stats()
+			try:
+				with sdpa_kernel( [ backend ] ):
+					out = torch.nn.functional.scaled_dot_product_attention(
+						q, k, v, attn_mask = mask )
+				peak_mb = torch.cuda.max_memory_allocated() / 1e6
+				print( f"[sdpa-probe] {name:14s}: OK   peak={peak_mb:7.1f} MB", file = sys.stderr )
+				del out
+			except Exception as e:
+				print(
+					f"[sdpa-probe] {name:14s}: FAIL {type( e ).__name__}: {str( e )[ :120 ]}",
+					file = sys.stderr )
+			torch.cuda.empty_cache()
+
+	class SDPAProbeCallback( TrainerCallback ):
+		# One-shot probe at train start to log which SDPA backend will service
+		# the depth-loop's custom additive mask. If we land on math, attention
+		# scores get materialized BxHxQxK — switch to FlexAttention / refactor
+		# the mask. If mem-efficient, attention is already O(N).
+		def __init__( self ):
+			self._done = False
+		def on_train_begin( self, args, state, control, model = None, **kwargs ):
+			if self._done or not state.is_world_process_zero or model is None:
+				return
+			if not torch.cuda.is_available():
+				return
+			self._done = True
+			m = model.module if hasattr( model, "module" ) else model
+			lm = m.lm_model if hasattr( m, "lm_model" ) else m
+			_probe_sdpa_backend( lm )
+
 	signal.signal( signal.SIGINT, _graceful_exit_handler )
 	signal.signal( signal.SIGTERM, _graceful_exit_handler )
 
@@ -1004,7 +1074,7 @@ def train(config, resume_from = None):
 		model_init = model_init,
 		processing_class = tokenizer,
 		eval_lm_batch_size = eval_lm_batch_size,
-		callbacks = [ ConfigArtifactCallback( config ), graceful_cb, SyncEmbeddingsCallback() ],
+		callbacks = [ ConfigArtifactCallback( config ), graceful_cb, SyncEmbeddingsCallback(), SDPAProbeCallback() ],
 	)
 	graceful_cb.bind( trainer )
 
