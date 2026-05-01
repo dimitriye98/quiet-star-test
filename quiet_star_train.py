@@ -708,7 +708,10 @@ def train(config, resume_from = None):
 			return results
 
 		def compute_loss( self, model, inputs, return_outputs = False, num_items_in_batch = None ):
-			inputs[ "past_key_values" ] = DynamicCache()
+			# training_forward allocates its own StaticCaches internally; the
+			# past_key_values input is ignored on the training path. Leaving
+			# it unset (None) avoids confusing readers with a dead DynamicCache.
+			inputs.pop( "past_key_values", None )
 
 			with cm_memory() if torch.cuda.is_available() else contextlib.nullcontext():
 				loss, o = super().compute_loss(
