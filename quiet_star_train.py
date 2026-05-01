@@ -640,6 +640,14 @@ def train(config, resume_from = None):
 	# steady-state training.
 	_memory_profile = os.environ.get( "QUIET_STAR_MEMORY_PROFILE" ) == "1"
 
+	# Opt-in kernel-level profiler: set QUIET_STAR_TORCH_PROFILE=1 to wrap
+	# training in torch.profiler. Records one full optimizer step (all grad-
+	# accumulation micro-batches) after a 2-step wait + 1-step warmup, then
+	# prints a top-30 kernel table sorted by CUDA time and writes a Chrome
+	# trace to <output_dir>/torch_profile/trace.json. Rank 0 only. Does not
+	# auto-stop training — scancel after the table prints to the slurm log.
+	_torch_profile = os.environ.get( "QUIET_STAR_TORCH_PROFILE" ) == "1"
+
 	@contextlib.contextmanager
 	def cm_memory():
 		if not _memory_profile:
@@ -815,6 +823,56 @@ def train(config, resume_from = None):
 				m = model.module if hasattr( model, "module" ) else model
 				m.sync_thought_embeddings()
 			return control
+
+	class TorchProfilerCallback( TrainerCallback ):
+		"""Opt-in torch.profiler wrapper gated on QUIET_STAR_TORCH_PROFILE=1.
+		Schedule wait=2 / warmup=1 / active=1 / repeat=1: skips two optimizer
+		steps for steady-state, takes one warmup step, records the next full
+		optimizer step (with all grad-accum micro-batches), then transitions
+		to NONE. on_trace_ready prints a top-30 kernel table sorted by CUDA
+		time and writes a Chrome trace; rank 0 only. Does not auto-stop —
+		scancel after the table prints (avoids the should_training_stop /
+		DDP cross-rank hang)."""
+		def __init__( self ):
+			self._prof = None
+			self._output_dir = None
+
+		def on_train_begin( self, args, state, control, **kwargs ):
+			if int( os.environ.get( "RANK", "0" ) ) != 0:
+				return
+			self._output_dir = args.output_dir
+			self._prof = torch.profiler.profile(
+				activities = [
+					torch.profiler.ProfilerActivity.CPU,
+					torch.profiler.ProfilerActivity.CUDA ],
+				schedule = torch.profiler.schedule(
+					wait = 2, warmup = 1, active = 1, repeat = 1 ),
+				on_trace_ready = self._on_trace_ready,
+				record_shapes = True,
+			)
+			self._prof.start()
+
+		def on_step_end( self, args, state, control, **kwargs ):
+			if self._prof is not None:
+				self._prof.step()
+			return control
+
+		def on_train_end( self, args, state, control, **kwargs ):
+			if self._prof is not None:
+				self._prof.stop()
+				self._prof = None
+
+		def _on_trace_ready( self, prof ):
+			out_dir = os.path.join( self._output_dir, "torch_profile" )
+			os.makedirs( out_dir, exist_ok = True )
+			trace_path = os.path.join( out_dir, "trace.json" )
+			prof.export_chrome_trace( trace_path )
+			table = prof.key_averages().table(
+				sort_by = "cuda_time_total", row_limit = 30 )
+			print(
+				f"\n[torch-profile] top kernels by CUDA time:\n{table}\n"
+				f"[torch-profile] chrome trace -> {trace_path}",
+				file = sys.stderr )
 
 	class DeepSpeedSafeWandbCallback( WandbCallback ):
 		# Default WandbCallback.on_train_end builds a throwaway Trainer to call
@@ -997,6 +1055,9 @@ def train(config, resume_from = None):
 	training_args = TrainingArguments( **tr )
 
 	graceful_cb = GracefulStopCallback()
+	cb_list = [ ConfigArtifactCallback( config ), graceful_cb, SyncEmbeddingsCallback() ]
+	if _torch_profile:
+		cb_list.append( TorchProfilerCallback() )
 	trainer = TrainerWithCache(
 		args = training_args,
 		train_dataset = train_dataset,
@@ -1004,7 +1065,7 @@ def train(config, resume_from = None):
 		model_init = model_init,
 		processing_class = tokenizer,
 		eval_lm_batch_size = eval_lm_batch_size,
-		callbacks = [ ConfigArtifactCallback( config ), graceful_cb, SyncEmbeddingsCallback() ],
+		callbacks = cb_list,
 	)
 	graceful_cb.bind( trainer )
 
