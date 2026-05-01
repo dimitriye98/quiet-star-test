@@ -634,8 +634,17 @@ def train(config, resume_from = None):
 
 	torch.backends.cuda.matmul.allow_tf32 = True
 
+	# Opt-in memory profiler: set QUIET_STAR_MEMORY_PROFILE=1 to record per-step
+	# allocator history and dump snapshot.pickle. Off by default — the recorder
+	# adds CPU overhead and per-step pickle writes that are pure waste in
+	# steady-state training.
+	_memory_profile = os.environ.get( "QUIET_STAR_MEMORY_PROFILE" ) == "1"
+
 	@contextlib.contextmanager
 	def cm_memory():
+		if not _memory_profile:
+			yield
+			return
 		torch.cuda.memory._record_memory_history( max_entries = 100000, stacks = "python" )
 		try:
 			yield

@@ -460,31 +460,31 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		# Generate thoughts (depth 0 already cached from naive_forward)
 		# We accumulate hidden states (for FLCE later) and per-slice entropy (for logging).
-		# Slice logits are computed for sampling, then discarded — the giant thought_logits
-		# tensor is never materialized.
+		# lm_head is applied under no_grad for sampling/entropy only — the thought REINFORCE
+		# gradient flows through thought_hidden_states via FLCE later, so keeping lm_head out
+		# of the autograd graph here saves ~b*n*l*vocab activation per depth step.
 		layers_cached, layer_to_gen = 1, 2
 		thought_hidden_states = None
 		thought_entropy_acc = None
 		for i in range( self.thought_depth ):
 			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
 
-			new_logs, new_hidden = self.broadcast_forward(
+			_, new_hidden = self.broadcast_forward(
 				ts[ :, :, layers_cached: layer_to_gen, : ],
 				kv_cache,
 				layers_cached,
 				layer_to_gen,
-				slice_mask )
+				slice_mask,
+				compute_logits = False )
 
 			if i == 0:
 				thought_hidden_states = new_hidden
 			else:
 				thought_hidden_states = t.cat( (thought_hidden_states, new_hidden), dim = -3 )
 
-			new_toks = self.sample_thoughts( new_logs, thought_temperature ).detach()
-
-			# Per-slice entropy under no_grad — reuses the just-computed slice logits so we
-			# don't have to recompute lm_head for the entropy stat.
 			with t.no_grad():
+				new_logs = self.lm_model.lm_head( new_hidden )
+				new_toks = self.sample_thoughts( new_logs, thought_temperature )
 				slice_log_probs = t.nn.functional.log_softmax( new_logs / self.reinforce_temperature, dim = -1 )
 				slice_entropy = -(slice_log_probs.exp() * slice_log_probs).sum( dim = -1 )
 				if i == 0:
