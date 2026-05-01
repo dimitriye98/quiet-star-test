@@ -478,24 +478,31 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# Truncate the input by look_ahead
 		truncated_input = input_ids[ ..., :-self.look_ahead ]
 
-		# Duplicate the batch for each thought
-		ts = x.rearrange( "b l -> b n 1 l", truncated_input, n = n )
-		# padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = self.n_thoughts )
-
-		# Add <thought>
-		start_toks = t.full(
-			(ts.shape[ 0 ], ts.shape[ 1 ], 1, ts.shape[ 3 ]), self.start_thought_token_id, device = ts.device,
-			dtype = ts.dtype )
-		ts = t.cat( (ts, start_toks), dim = -2 )
+		# Preallocate ts at the full d-layer layout. Slot layout:
+		#   [0]                      input prefix (b broadcast across n)
+		#   [1]                      start_thought_token_id
+		#   [2 .. 1+thought_depth]   sampled thought tokens (filled in the loop)
+		#   [2+thought_depth]        end_thought_token_id
+		#   [3+thought_depth .. d-1] look_ahead-1 target tokens (teacher forcing)
+		# Replaces the original cat-grow pattern (4 separate t.cat allocations).
+		ts = t.empty( (b, n, d, l), dtype = truncated_input.dtype, device = device )
+		ts[ :, :, 0, : ] = truncated_input.unsqueeze( 1 )
+		ts[ :, :, 1, : ] = self.start_thought_token_id
 
 		# rank-6 mask of shape (b, n, d, l, d, l)
 		thought_mask = self.construct_thought_mask(
-			b = ts.shape[ 0 ],
-			n = ts.shape[ 1 ],
-			d = 2 + self.look_ahead + self.thought_depth,  # input (1), start tok (1), depth, end tok (1), look ahead (-1 for teacher forcing shift)
-			l = ts.shape[ 3 ],
-			padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = self.n_thoughts )[ ..., :-self.look_ahead ],
+			b = b,
+			n = n,
+			d = d,  # input (1), start tok (1), depth, end tok (1), look ahead (-1 for teacher forcing shift)
+			l = l,
+			padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = n )[ ..., :-self.look_ahead ],
 			dtype = self.dtype )
+
+		# Preallocate per-step accumulators. Replaces the in-loop t.cat that was
+		# O(thought_depth^2) memcpy and would force per-iter Dynamo recompiles.
+		e = self.lm_model.config.hidden_size
+		thought_hidden_states = t.empty( (b, n, self.thought_depth, l, e), dtype = dtype, device = device )
+		thought_entropy_acc = t.empty( (b, n, self.thought_depth, l), dtype = dtype, device = device )
 
 		# Generate thoughts (depth 0 already cached from naive_forward)
 		# We accumulate hidden states (for FLCE later) and per-slice entropy (for logging).
@@ -503,54 +510,50 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		# gradient flows through thought_hidden_states via FLCE later, so keeping lm_head out
 		# of the autograd graph here saves ~b*n*l*vocab activation per depth step.
 		layers_cached, layer_to_gen = 1, 2
-		thought_hidden_states = None
-		thought_entropy_acc = None
 		for i in range( self.thought_depth ):
 			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
 
+			# .clone() on the input slot — embed_tokens.backward saves the input_ids
+			# tensor for its weight-gradient scatter, and we mutate ts in-place
+			# inside this loop (sampled tokens written to subsequent slots). Without
+			# the clone, ts's version bumps invalidate the saved views from earlier
+			# iterations.
 			_, new_hidden = self.broadcast_forward(
-				ts[ :, :, layers_cached: layer_to_gen, : ],
+				ts[ :, :, layers_cached: layer_to_gen, : ].clone(),
 				broadcast_cache,
 				layers_cached,
 				layer_to_gen,
 				slice_mask,
 				compute_logits = False )
 
-			if i == 0:
-				thought_hidden_states = new_hidden
-			else:
-				thought_hidden_states = t.cat( (thought_hidden_states, new_hidden), dim = -3 )
+			thought_hidden_states[ :, :, i: i + 1, :, : ] = new_hidden
 
 			with t.no_grad():
 				new_logs = self.lm_model.lm_head( new_hidden )
 				new_toks = self.sample_thoughts( new_logs, thought_temperature )
 				slice_log_probs = t.nn.functional.log_softmax( new_logs / self.reinforce_temperature, dim = -1 )
 				slice_entropy = -(slice_log_probs.exp() * slice_log_probs).sum( dim = -1 )
-				if i == 0:
-					thought_entropy_acc = slice_entropy
-				else:
-					thought_entropy_acc = t.cat( (thought_entropy_acc, slice_entropy), dim = -2 )
+				thought_entropy_acc[ :, :, i: i + 1, : ] = slice_entropy
 
 			del new_logs
 
 			layers_cached = layer_to_gen
 			layer_to_gen += 1
 
-			ts = t.cat( (ts, new_toks), dim = -2 )
+			# Sampled token goes into the slot it just generated.
+			ts[ :, :, layer_to_gen - 1: layer_to_gen, : ] = new_toks
 
-		# Add </thought>
-		end_toks = t.full(
-			(ts.shape[ 0 ], ts.shape[ 1 ], 1, ts.shape[ 3 ]), self.end_thought_token_id, device = ts.device,
-			dtype = ts.dtype )
-		ts = t.cat( (ts, end_toks), dim = -2 )
+		# Add </thought> at slot 2 + thought_depth.
+		ts[ :, :, 2 + self.thought_depth, : ] = self.end_thought_token_id
 		layer_to_gen += 1
 
 		# Prepare the sliding targets
 		targets = labels.unfold( -1, self.look_ahead, 1 )[ :, 1: ].transpose( -1, -2 )
-		targets = x.rearrange( "b d l -> b n d l", targets, n = self.n_thoughts, d = self.look_ahead )
+		targets = x.rearrange( "b d l -> b n d l", targets, n = n, d = self.look_ahead )
 
-		# Append the targets to the thoughts (minus one for teacher forcing shift)
-		ts = t.cat( (ts, targets[ :, :, :-1, : ]), dim = -2 )
+		# Write targets[:, :, :-1, :] into the trailing slots (teacher forcing shift
+		# drops the last target — its hidden state isn't used).
+		ts[ :, :, 3 + self.thought_depth: d, : ] = targets[ :, :, :-1, : ]
 
 		# Hidden states with thought (no lm_head — losses are fused via FLCE below)
 		if self.look_ahead_pass:
