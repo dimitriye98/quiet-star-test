@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import shlex
 import shutil
@@ -10,6 +11,10 @@ from datetime import datetime
 from functools import partial
 
 from quiet_star.config import DEFAULT_CONFIG, resolve_torch_dtype, save_config, load_config
+
+
+_PENDING_MANIFEST = "pending_upload.json"
+_PENDING_SENTINEL = ".pending_upload_dir"
 
 
 def _resolve_wandb_cache_dir( root_prefix_arg, path_cfg ):
@@ -70,6 +75,140 @@ def config_from_wandb_checkpoint( resume_from ):
 	raise ValueError( f"No config artifact found for run {run.name}" )
 
 
+def _resolve_local_resume( path ):
+	"""Resolve a local --resume path to (checkpoint_dir, output_dir, run_info).
+	Accepts either a `checkpoint-N` dir or its parent `output_dir` (in which
+	case the latest checkpoint-N is selected). Recovers the wandb run id from
+	the durable `wandb_run.json` sidecar written at training start, falling
+	back to a `pending_upload.json` manifest if the sidecar is missing."""
+	path = os.path.abspath( path )
+	if os.path.exists( os.path.join( path, "trainer_state.json" ) ):
+		ckpt_dir = path
+		output_dir = os.path.dirname( path )
+	else:
+		candidates = []
+		for entry in os.listdir( path ):
+			if entry.startswith( "checkpoint-" ) and os.path.isdir( os.path.join( path, entry ) ):
+				try:
+					candidates.append( ( int( entry.split( "-" )[ 1 ] ), entry ) )
+				except ValueError:
+					continue
+		if not candidates:
+			raise ValueError( f"No checkpoint-N subdirs found in {path}" )
+		ckpt_dir = os.path.join( path, max( candidates )[ 1 ] )
+		output_dir = path
+
+	sidecar = os.path.join( output_dir, "wandb_run.json" )
+	if os.path.exists( sidecar ):
+		with open( sidecar ) as f:
+			run_info = json.load( f )
+	else:
+		manifest = os.path.join( ckpt_dir, _PENDING_MANIFEST )
+		if not os.path.exists( manifest ):
+			raise ValueError(
+				f"No wandb_run.json or pending_upload.json near {path}; "
+				f"cannot recover run id for resume." )
+		with open( manifest ) as f:
+			m = json.load( f )
+		run_info = {
+			"run_id": m[ "wandb" ][ "run_id" ],
+			"project": m[ "wandb" ][ "project" ],
+			"entity": m[ "wandb" ].get( "entity" ),
+		}
+	return ckpt_dir, output_dir, run_info
+
+
+def config_from_local_checkpoint( path ):
+	"""Load config.yaml from a local checkpoint path's containing output_dir."""
+	_, output_dir, _ = _resolve_local_resume( path )
+	config_path = os.path.join( output_dir, "config.yaml" )
+	if not os.path.exists( config_path ):
+		raise ValueError( f"No config.yaml at {config_path}" )
+	return load_config( config_path )
+
+
+def submit_uploader( pending_dir ):
+	"""Dispatched by the graceful-stop trap. Reads `.uploader_config.json` from
+	the current worktree (set up by submit_slurm) and submits an sbatch job that
+	runs `run-uploader-job` against pending_dir. Pending dir + worktree paths are
+	passed to the child job via env vars exported through `--export=ALL`."""
+	worktree = os.environ.get( "QUIET_STAR_WORKTREE_PATH" ) or os.getcwd()
+	cfg_path = os.path.join( worktree, ".uploader_config.json" )
+	with open( cfg_path ) as f:
+		cfg = json.load( f )
+	# --chdir keeps slurm-%j.out OUT of the worktree (which run_uploader_job
+	# deletes before the job exits). Without this the log file is unlinked
+	# while still being written and disappears when the fd closes.
+	cmd = [
+		"sbatch",
+		f"--chdir={cfg[ 'repo_root' ]}",
+		*cfg[ "sbatch_flags" ],
+		f"--dependency=afterany:{os.environ[ 'SLURM_JOB_ID' ]}",
+		"--export=ALL",
+		cfg[ "uploader_script" ],
+	]
+	env = os.environ.copy()
+	env[ "QUIET_STAR_PENDING_DIR" ] = os.path.abspath( pending_dir )
+	subprocess.run( cmd, env = env, check = True )
+
+
+def run_uploader_job():
+	"""Runs as the uploader sbatch job. Uploads the pending checkpoint(s) then
+	removes the worktree. Reads pending dir + worktree paths from env vars set
+	by submit_uploader's --export=ALL."""
+	pending = os.environ[ "QUIET_STAR_PENDING_DIR" ]
+	worktree = os.environ[ "QUIET_STAR_WORKTREE_PATH" ]
+	repo_root = os.environ[ "QUIET_STAR_REPO_ROOT" ]
+	upload_pending( pending )
+	subprocess.run(
+		[ "git", "-C", repo_root, "worktree", "remove", "--force", worktree ],
+		check = True )
+
+
+def upload_pending( output_dir ):
+	"""Walk output_dir for `*/pending_upload.json` manifests left by graceful-stop
+	handlers and upload each to wandb. The manifest mirrors what HF's
+	WandbCallback.on_save would have logged in-process. On success, the manifest
+	is removed; the checkpoint dir is preserved so --resume from the local path
+	still works. On failure, the manifest stays so a re-run can retry."""
+	import wandb
+
+	manifests = []
+	if os.path.isfile( os.path.join( output_dir, _PENDING_MANIFEST ) ):
+		manifests.append( os.path.join( output_dir, _PENDING_MANIFEST ) )
+	for entry in sorted( os.listdir( output_dir ) ):
+		path = os.path.join( output_dir, entry, _PENDING_MANIFEST )
+		if os.path.isfile( path ):
+			manifests.append( path )
+
+	if not manifests:
+		print( f"[upload-pending] no manifests under {output_dir}", file = sys.stderr )
+		return
+
+	for manifest_path in manifests:
+		with open( manifest_path ) as f:
+			manifest = json.load( f )
+		ckpt_dir = manifest[ "checkpoint_dir" ]
+		w = manifest[ "wandb" ]
+		print( f"[upload-pending] uploading {ckpt_dir} -> {w['artifact_name']} (run {w['run_id']})", file = sys.stderr )
+		wandb.init(
+			id = w[ "run_id" ],
+			project = w[ "project" ],
+			entity = w.get( "entity" ),
+			resume = "must",
+		)
+		artifact = wandb.Artifact(
+			name = w[ "artifact_name" ],
+			type = w.get( "artifact_type", "model" ),
+			metadata = w.get( "metadata", {} ),
+		)
+		artifact.add_dir( ckpt_dir )
+		wandb.log_artifact( artifact, aliases = w.get( "aliases", [] ) )
+		wandb.finish()
+		os.remove( manifest_path )
+		print( f"[upload-pending] uploaded and removed {manifest_path}", file = sys.stderr )
+
+
 SLURM_TEMPLATE = """\
 # Slurm job configuration for quiet-star training.
 # Keys map directly to sbatch options (simple-slurm).
@@ -88,6 +227,24 @@ cpus_per_task: 4
 # setup: |
 #   ssh -fN -D 1080 proxy-host
 #   export HTTPS_PROXY=socks5://localhost:1080
+
+# Optional follow-on job for uploading checkpoints saved on Slurm preemption.
+# When training receives SIGTERM, the handler saves a checkpoint + manifest and
+# exits without uploading to wandb (the upload would exceed Slurm's grace
+# period). The trap then submits an uploader job with the overrides below
+# (merged onto the main config; set a key to `null` to remove it). Without an
+# `uploader:` section, the manifest is left in place and must be uploaded
+# manually with `quiet_star_train.py upload-pending <output_dir>`.
+#
+# `setup` is inherited from the top-level setup by default (so SOCKS proxies
+# needed for wandb access apply automatically). Set `uploader.setup: null` to
+# disable, or supply a different block here to override.
+# uploader:
+#   partition: cpu
+#   gres: null
+#   time: "06:00:00"
+#   mem: "8G"
+#   cpus_per_task: 2
 """
 
 
@@ -129,6 +286,7 @@ def submit_slurm( slurm_config_path, train_args ):
 	with open( slurm_config_path ) as f:
 		slurm_params = yaml.safe_load( f )
 	setup_script = slurm_params.pop( "setup", None )
+	uploader_overrides = slurm_params.pop( "uploader", None )
 	slurm_params.setdefault( "job_name", "qstar" )
 	slurm = Slurm( **slurm_params )
 
@@ -162,7 +320,15 @@ def submit_slurm( slurm_config_path, train_args ):
 	if train_args.path is not None:
 		script_parts.append( config_basename )
 	if train_args.resume is not None:
-		script_parts.extend( [ "--resume", train_args.resume ] )
+		# The inner sbatch script `cd`s to the new worktree before launching
+		# python, so a relative --resume path resolves against the wrong CWD on
+		# the inner side and falls through to the wandb-artifact path with a
+		# confusing error. Absolutize local-directory resumes here; leave wandb
+		# refs alone.
+		resume_arg = train_args.resume
+		if os.path.isdir( resume_arg ):
+			resume_arg = os.path.abspath( resume_arg )
+		script_parts.extend( [ "--resume", resume_arg ] )
 	script_args = " ".join( shlex.quote( p ) for p in script_parts )
 
 	train_cmd = (
@@ -175,16 +341,99 @@ def submit_slurm( slurm_config_path, train_args ):
 		f" --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT"
 		f" {script_args}" )
 
-	# Setup: cd into worktree; cleanup worktree on exit (only if job succeeded)
+	# If the slurm config has an `uploader:` section, write a small launcher
+	# script (.uploader.sh) plus a sidecar with the merged sbatch flags. The
+	# graceful-stop trap invokes `submit-uploader` (a Python subcommand) which
+	# reads the sidecar and dispatches an sbatch job whose payload is the
+	# launcher script. The launcher runs the setup block (proxies / module loads
+	# / etc.) before exec'ing run-uploader-job. Without an `uploader:` section,
+	# nothing is written; the trap then prints a manual recovery hint instead.
+	#
+	# Setup resolution: an explicit `uploader.setup` (including null) wins;
+	# otherwise inherit the top-level `setup` so things like SOCKS proxies
+	# needed for wandb access apply by default.
+	uploader_config_path = os.path.join( worktree_path, ".uploader_config.json" )
+	if uploader_overrides is not None:
+		if "setup" in uploader_overrides:
+			uploader_setup = uploader_overrides.pop( "setup" )
+		else:
+			uploader_setup = setup_script
+		uploader_flags = dict( slurm_params )
+		for k, v in uploader_overrides.items():
+			if v is None:
+				uploader_flags.pop( k, None )
+			else:
+				uploader_flags[ k ] = v
+		uploader_flags[ "job_name" ] = uploader_flags.get( "job_name", "qstar" ) + "-upload"
+		# submit_uploader adds --dependency at submit-time; strip any inherited value.
+		uploader_flags.pop( "dependency", None )
+		flag_strs = []
+		for k, v in uploader_flags.items():
+			opt = "--" + k.replace( "_", "-" )
+			if isinstance( v, bool ):
+				if v:
+					flag_strs.append( opt )
+			else:
+				flag_strs.append( f"{opt}={v}" )
+
+		uploader_script_path = os.path.join( worktree_path, ".uploader.sh" )
+		setup_section = ( uploader_setup.rstrip() + "\n" ) if uploader_setup else ""
+		with open( uploader_script_path, "w" ) as f:
+			f.write(
+				"#!/bin/bash\n"
+				"set -euo pipefail\n"
+				+ setup_section
+				+ f"exec {shlex.quote( python )} {shlex.quote( script )} run-uploader-job\n"
+			)
+		os.chmod( uploader_script_path, 0o755 )
+
+		with open( uploader_config_path, "w" ) as f:
+			json.dump(
+				{
+					"sbatch_flags": flag_strs,
+					"uploader_script": uploader_script_path,
+					"repo_root": repo_root,
+					"worktree_path": worktree_path,
+				},
+				f, indent = 2 )
+
+	# Setup: cd into worktree; export paths as shell vars so the trap can
+	# reference them by $VAR (single-quote-safe) without embedding shlex-quoted
+	# strings inside the trap's '...' body.
+	# Trap branches:
+	# - sentinel present: invoke `submit-uploader` (Python) which submits the
+	#   uploader sbatch job. Worktree is preserved; uploader cleans it up.
+	# - rc==0, no sentinel: normal completion → remove worktree.
+	# - rc!=0, no sentinel: real failure → preserve worktree for inspection.
+	sentinel_path = os.path.join( worktree_path, _PENDING_SENTINEL )
 	slurm.add_cmd( f"cd {shlex.quote( worktree_path )}" )
+	slurm.add_cmd( f"WORKTREE_PATH={shlex.quote( worktree_path )}" )
+	slurm.add_cmd( f"REPO_ROOT={shlex.quote( repo_root )}" )
+	slurm.add_cmd( f"SENTINEL={shlex.quote( sentinel_path )}" )
+	slurm.add_cmd( f"PYTHON_BIN={shlex.quote( python )}" )
+	slurm.add_cmd( f"SCRIPT_PATH={shlex.quote( script )}" )
+	# Handler-side env vars (read by the Python signal handler / subcommands).
+	slurm.add_cmd( f"export QUIET_STAR_WORKTREE_PATH={shlex.quote( worktree_path )}" )
+	slurm.add_cmd( f"export QUIET_STAR_REPO_ROOT={shlex.quote( repo_root )}" )
+	if uploader_overrides is not None:
+		preempt_branch = (
+			' echo "Preempted; submitting uploader for $PENDING" >&2;'
+			' "$PYTHON_BIN" "$SCRIPT_PATH" submit-uploader "$PENDING";' )
+	else:
+		preempt_branch = (
+			' echo "Preempted; no uploader configured. Run:'
+			' $PYTHON_BIN $SCRIPT_PATH upload-pending $PENDING" >&2;' )
 	slurm.add_cmd(
-		f"trap 'rc=$?;"
-		f" kill $(jobs -p) 2>/dev/null;"
-		f" if [ $rc -eq 0 ]; then"
-		f"  git -C {shlex.quote( repo_root )} worktree remove {shlex.quote( worktree_path )} --force;"
-		f" else"
-		f'  echo "Job failed (exit $rc); preserving worktree: {worktree_path}" >&2;'
-		f" fi' EXIT"
+		"trap 'rc=$?;"
+		" kill $(jobs -p) 2>/dev/null;"
+		' if [ -f "$SENTINEL" ]; then'
+		'  PENDING=$(cat "$SENTINEL");'
+		f" {preempt_branch}"
+		" elif [ $rc -eq 0 ]; then"
+		'  git -C "$REPO_ROOT" worktree remove "$WORKTREE_PATH" --force;'
+		" else"
+		'  echo "Job failed (exit $rc); preserving worktree: $WORKTREE_PATH" >&2;'
+		" fi' EXIT"
 	)
 
 	# Run user-provided setup script (e.g. SSH tunnels, module loads)
@@ -207,7 +456,8 @@ _interrupted = False
 
 
 def _graceful_exit_handler( signum, frame ):
-	"""Set flag on first interrupt; ignore subsequent signals so cleanup (e.g. wandb artifact upload) can finish. SIGKILL via scancel is still available as an escape hatch."""
+	"""Set flag on first interrupt; ignore subsequent signals so checkpoint save
+	and manifest write can complete. SIGKILL via scancel is still an escape hatch."""
 	global _interrupted
 	signal.signal( signal.SIGINT, signal.SIG_IGN )
 	signal.signal( signal.SIGTERM, signal.SIG_IGN )
@@ -317,6 +567,15 @@ def train(config, resume_from = None):
 			artifact = wandb.Artifact( name = f"config-{wandb.run.name}", type = "config" )
 			artifact.add_file( config_path )
 			wandb.run.log_artifact( artifact )
+			# Durable sidecar so --resume <local-dir> can recover the wandb run id
+			# even after the uploader job has cleared the pending_upload.json manifest.
+			sidecar = {
+				"run_id": wandb.run.id,
+				"project": wandb.run.project,
+				"entity": wandb.run.entity,
+			}
+			with open( os.path.join( args.output_dir, "wandb_run.json" ), "w" ) as f:
+				json.dump( sidecar, f, indent = 2 )
 
 	class GracefulStopCallback( TrainerCallback ):
 		def __init__( self ):
@@ -324,14 +583,59 @@ def train(config, resume_from = None):
 		def bind( self, trainer ):
 			self._trainer = trainer
 		def _save_and_exit( self, args, state, control ):
-			# should_save is a no-op on substep_end; sys.exit skips on_train_end's duplicate "last" upload.
+			# Save checkpoint to disk, then leave a manifest and sentinel for the
+			# outer sbatch trap to pick up. Skip the in-process wandb upload — it
+			# blows past Slurm's ~5-min preemption grace period; a follow-on
+			# uploader job (submitted by the trap) does it later with no time cap.
 			print( "Saving checkpoint and exiting...", file = sys.stderr )
 			self._trainer._save_checkpoint( self._trainer.model, trial = None )
-			self._trainer.callback_handler.on_save( args, state, control )
+			if state.is_world_process_zero:
+				self._write_manifest_and_sentinel( args, state )
+			# os._exit skips atexit (notably wandb's flush, which can block on uploads).
+			os._exit( 0 )
+		def _write_manifest_and_sentinel( self, args, state ):
 			import wandb
-			if wandb.run is not None:
-				wandb.finish()
-			sys.exit( 0 )
+			run = wandb.run
+			if run is None:
+				print( "[graceful-stop] wandb.run is None; skipping manifest", file = sys.stderr )
+				return
+			ckpt_dir = os.path.abspath( os.path.join( args.output_dir, f"checkpoint-{state.global_step}" ) )
+			# Mirror HF WandbCallback.on_save's artifact name/aliases/metadata so a
+			# resumed run sees the same artifact as if we had uploaded in-process.
+			artifact_name = (
+				f"model-{run.id}"
+				if ( args.run_name is None or args.run_name == args.output_dir )
+				else f"model-{run.name}" )
+			import numbers
+			metadata = {
+				k: v for k, v in dict( run.summary ).items()
+				if isinstance( v, numbers.Number ) and not k.startswith( "_" ) }
+			num_params = run.config.get( "model/num_parameters" )
+			if num_params is not None:
+				metadata[ "model/num_parameters" ] = num_params
+			manifest = {
+				"checkpoint_dir": ckpt_dir,
+				"wandb": {
+					"run_id": run.id,
+					"run_name": run.name,
+					"project": run.project,
+					"entity": run.entity,
+					"artifact_name": artifact_name,
+					"artifact_type": "model",
+					"metadata": metadata,
+					"aliases": [
+						f"epoch_{round( state.epoch, 2 )}",
+						f"checkpoint_global_step_{state.global_step}",
+					],
+				},
+			}
+			with open( os.path.join( ckpt_dir, _PENDING_MANIFEST ), "w" ) as f:
+				json.dump( manifest, f, indent = 2 )
+			# Sentinel tells the bash trap which output_dir to point the uploader at.
+			worktree = os.environ.get( "QUIET_STAR_WORKTREE_PATH" ) or os.getcwd()
+			with open( os.path.join( worktree, _PENDING_SENTINEL ), "w" ) as f:
+				f.write( os.path.abspath( args.output_dir ) + "\n" )
+			print( f"[graceful-stop] manifest written; output_dir={args.output_dir}", file = sys.stderr )
 		# Check per substep: a full optimizer step can outlast Slurm's preemption grace period.
 		def on_substep_end( self, args, state, control, **kwargs ):
 			if _interrupted:
@@ -518,10 +822,21 @@ def train(config, resume_from = None):
 	resume_checkpoint = None
 	if resume_from is not None:
 		print( f"[resume] WANDB_CACHE_DIR = {os.environ.get( 'WANDB_CACHE_DIR', '<unset>' )}", file = sys.stderr )
-		artifact, run = _resolve_resume( resume_from )
-		print( f"[resume] downloading artifact {artifact.name} (created {artifact.created_at})", file = sys.stderr )
-		resume_checkpoint = artifact.download()
-		print( f"[resume] artifact materialised at {resume_checkpoint}", file = sys.stderr )
+		if os.path.isdir( resume_from ):
+			ckpt_dir, _, run_info = _resolve_local_resume( resume_from )
+			os.environ[ "WANDB_RUN_ID" ] = run_info[ "run_id" ]
+			os.environ[ "WANDB_RESUME" ] = "must"
+			if run_info.get( "project" ):
+				os.environ.setdefault( "WANDB_PROJECT", run_info[ "project" ] )
+			if run_info.get( "entity" ):
+				os.environ.setdefault( "WANDB_ENTITY", run_info[ "entity" ] )
+			resume_checkpoint = ckpt_dir
+			print( f"[resume] resuming from local path {ckpt_dir} (run_id={run_info['run_id']})", file = sys.stderr )
+		else:
+			artifact, run = _resolve_resume( resume_from )
+			print( f"[resume] downloading artifact {artifact.name} (created {artifact.created_at})", file = sys.stderr )
+			resume_checkpoint = artifact.download()
+			print( f"[resume] artifact materialised at {resume_checkpoint}", file = sys.stderr )
 
 	print("distributed_type:", trainer.accelerator.distributed_type)
 	print("deepspeed_plugin:", trainer.accelerator.state.deepspeed_plugin)
@@ -544,12 +859,23 @@ if __name__ == "__main__":
 
 	train_parser = subparsers.add_parser( "train", help = "Train from a config file" )
 	train_parser.add_argument( "path", nargs = "?", default = None, help = "Config path (uses built-in defaults if omitted)" )
-	train_parser.add_argument( "--resume", metavar = "ARTIFACT", default = None,
-		help = "W&B checkpoint artifact to resume from" )
+	train_parser.add_argument( "--resume", metavar = "ARTIFACT_OR_PATH", default = None,
+		help = "W&B checkpoint artifact, run path, or local checkpoint dir to resume from" )
 	train_parser.add_argument( "--slurm", metavar = "SLURM_CONFIG", default = None,
 		help = "Submit to Slurm using this config file instead of running locally" )
 	train_parser.add_argument( "--root-prefix", metavar = "PATH", default = None,
 		help = "Root path for cache/output dirs; overrides WANDB_CACHE_DIR and config root_prefix" )
+
+	upload_parser = subparsers.add_parser( "upload-pending",
+		help = "Upload checkpoints flagged by graceful-stop manifests" )
+	upload_parser.add_argument( "output_dir", help = "Training output_dir to scan for pending manifests" )
+
+	submit_uploader_parser = subparsers.add_parser( "submit-uploader",
+		help = "(Internal) Submit an uploader sbatch job for the given pending dir" )
+	submit_uploader_parser.add_argument( "pending_dir", help = "Output_dir containing pending_upload.json" )
+
+	subparsers.add_parser( "run-uploader-job",
+		help = "(Internal) Uploader sbatch job entrypoint; reads QUIET_STAR_PENDING_DIR" )
 
 	args = parser.parse_args()
 
@@ -560,6 +886,12 @@ if __name__ == "__main__":
 		with open( args.path, "w" ) as f:
 			f.write( SLURM_TEMPLATE )
 		print( f"Wrote Slurm template to {args.path}" )
+	elif args.command == "upload-pending":
+		upload_pending( args.output_dir )
+	elif args.command == "submit-uploader":
+		submit_uploader( args.pending_dir )
+	elif args.command == "run-uploader-job":
+		run_uploader_job()
 	elif args.command == "train":
 		if args.slurm is not None:
 			submit_slurm( args.slurm, args )
@@ -576,7 +908,10 @@ if __name__ == "__main__":
 			# When resuming, always use the checkpoint's config — --path is
 			# consulted only for root_prefix above and then discarded.
 			if args.resume is not None:
-				cfg = config_from_wandb_checkpoint( args.resume )
+				if os.path.isdir( args.resume ):
+					cfg = config_from_local_checkpoint( args.resume )
+				else:
+					cfg = config_from_wandb_checkpoint( args.resume )
 			elif path_cfg is not None:
 				cfg = path_cfg
 			else:
