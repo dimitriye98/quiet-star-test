@@ -274,10 +274,12 @@ cpus_per_task: 4
 #   export http_proxy=socks5://localhost:1080
 #   export https_proxy=socks5://localhost:1080
 
-# Optional per-node bash commands, run via `srun --ntasks-per-node=1` so each
-# allocated node executes them once. Env vars set here do NOT propagate to
-# training (those belong in `setup`). Use this for per-node daemons that have
-# to listen on each node's localhost — SOCKS proxies, fuse mounts, etc.
+# Optional per-node bash commands, run as part of the training srun's per-task
+# script (one execution per allocated node) before torchrun starts. Use this
+# for per-node daemons (SOCKS proxies, fuse mounts) that need to outlive setup
+# — running them in a separate srun step has them killed by Slurm cgroup
+# cleanup the moment that step ends. Env vars exported here DO propagate to
+# training because we exec into torchrun in the same shell.
 # per_node_setup: |
 #   ssh -fN -D 1080 proxy-host
 
@@ -418,15 +420,29 @@ def submit_slurm( slurm_config_path, train_args ):
 		script_parts.extend( [ "--resume", resume_arg ] )
 	script_args = " ".join( shlex.quote( p ) for p in script_parts )
 
-	train_cmd = (
-		f"srun --export=ALL --kill-on-bad-exit=1"
-		f" {shlex.quote( python )} -m torch.distributed.run"
+	torchrun_cmd = (
+		f"{shlex.quote( python )} -m torch.distributed.run"
 		f" --nnodes=$SLURM_NNODES"
 		f" --nproc_per_node=$SLURM_GPUS_ON_NODE"
 		f" --rdzv_id=$SLURM_JOB_ID"
 		f" --rdzv_backend=c10d"
 		f" --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT"
 		f" {script_args}" )
+	# per_node_setup runs as part of the training srun's per-task script so its
+	# child processes (e.g. backgrounded `ssh -fN -D` SOCKS proxies) stay in the
+	# same Slurm cgroup as torchrun and live for the whole training step.
+	# Running them in a separate srun step has them killed by Slurm cgroup
+	# cleanup the moment that step ends — before training even starts.
+	if per_node_setup is not None:
+		inner = (
+			"set -euo pipefail\n"
+			+ per_node_setup.rstrip()
+			+ f"\nexec {torchrun_cmd}\n" )
+		train_cmd = (
+			"srun --export=ALL --kill-on-bad-exit=1 bash -c "
+			+ shlex.quote( inner ) )
+	else:
+		train_cmd = f"srun --export=ALL --kill-on-bad-exit=1 {torchrun_cmd}"
 
 	# If the slurm config has an `uploader:` section, write a sidecar with the
 	# merged sbatch flags + setup commands. The training process reads this at
@@ -503,13 +519,9 @@ def submit_slurm( slurm_config_path, train_args ):
 	if setup_script is not None:
 		slurm.add_cmd( setup_script )
 
-	# Run per-node setup once per allocated node (e.g. starting a SOCKS proxy
-	# that has to listen on each node's localhost). Env vars set here don't
-	# propagate to training — those belong in `setup` above.
-	if per_node_setup is not None:
-		slurm.add_cmd(
-			"srun --nodes=$SLURM_NNODES --ntasks-per-node=1 bash -c "
-			+ shlex.quote( per_node_setup ) )
+	# (per_node_setup is wired into train_cmd's per-task bash above, so each
+	# allocated node runs it before exec'ing torchrun. See the long-form
+	# rationale there.)
 
 	# Set up distributed env vars
 	slurm.add_cmd(
