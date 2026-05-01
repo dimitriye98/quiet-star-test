@@ -463,6 +463,10 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			input_ids[ :, :-1 ], padding_mask[ :, :-1 ],
 			kv_cache = prior_cache, cache_pos = cache_pos_prior,
 			keep = input_ids.shape[ -1 ], compute_logits = False )
+		# Clone before later compiled calls overwrite the CUDA Graph static
+		# output buffer this view points into. Required under mode=reduce-overhead;
+		# wasteful (~10 us / step) but harmless under mode=default.
+		prior_hidden_states = prior_hidden_states.clone()
 		prior_hidden_states = prior_hidden_states.unfold( -2, self.look_ahead, 1 )
 		prior_hidden_states = x.rearrange( "b l e d -> b n d l e", prior_hidden_states, n = n )
 
@@ -785,6 +789,12 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		prior_logits, prior_hidden = self.naive_forward(
 			input_ids, padding_mask, kv_cache = kv_cache, cache_pos = cache_pos
 		)
+		# Clone prior_hidden — the thought-generation loop's compiled calls
+		# below would otherwise overwrite the CUDA Graph static buffer this
+		# view points into before mixer_head reads it. prior_logits is fresh
+		# (lm_head allocates its own output and is not part of the compiled
+		# region) so it doesn't need cloning.
+		prior_hidden = prior_hidden.clone()
 
 		# Catenate the start token
 		start_toks = t.full(

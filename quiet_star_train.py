@@ -648,6 +648,15 @@ def train(config, resume_from = None):
 	# auto-stop training — scancel after the table prints to the slurm log.
 	_torch_profile = os.environ.get( "QUIET_STAR_TORCH_PROFILE" ) == "1"
 
+	# Opt-in torch.compile for the inner transformer (lm_model.model). The env
+	# var value IS the compile mode — set "default" (safe, Dynamo + Inductor),
+	# "reduce-overhead" (CUDA graphs; depends on stable tensor identities, which
+	# StaticCache provides), or "max-autotune" (most aggressive). Unset or empty
+	# disables. Compiling the inner transformer (not lm_model itself) is what
+	# matters: training_forward calls lm_model.model(...) for both the prior
+	# pass and every broadcast_forward in the depth loop / look-ahead pass.
+	_compile_mode = os.environ.get( "QUIET_STAR_COMPILE" ) or None
+
 	@contextlib.contextmanager
 	def cm_memory():
 		if not _memory_profile:
@@ -968,7 +977,14 @@ def train(config, resume_from = None):
 
 		# DeepSpeed manages device placement; device_map conflicts with it
 		dm = None if training_args.deepspeed else config["base_model"]["device_map"]
-		lm_model = AutoLigerKernelForCausalLM.from_pretrained(
+		# torch.compile + Liger conflict: LigerRopeFunction (a custom autograd
+		# Function that mutates q/k in-place) makes Dynamo's higher-order-ops
+		# tracer assert on the forward subgraph's output handling. Fall back
+		# to vanilla HF kernels when compile is enabled. The explicit Liger
+		# FLCE in ThoughtModel is unaffected — it's instantiated directly,
+		# not part of lm_model.model.forward.
+		LMClass = AutoModelForCausalLM if _compile_mode is not None else AutoLigerKernelForCausalLM
+		lm_model = LMClass.from_pretrained(
 			config["base_model"]["name"],
 			torch_dtype = dtype,
 			device_map = dm,
@@ -981,6 +997,24 @@ def train(config, resume_from = None):
 		special_tokens_to_add = [ "<thought>", "</thought>" ]
 		tokenizer.add_special_tokens( { "additional_special_tokens": special_tokens_to_add } )
 		lm_model.resize_token_embeddings( len( tokenizer ) )
+
+		# Compile the inner transformer's forward method (NOT the module itself).
+		# torch.compile(module) returns an OptimizedModule and replacing
+		# lm_model.model with it makes accelerate's is_compiled_module walk
+		# (which recurses through submodules) report the outer ThoughtModel as
+		# compiled. accelerate's unwrap_model then does
+		# `model.__dict__["_orig_mod"]` on ThoughtModel and KeyErrors out, since
+		# only the inner submodule is an OptimizedModule. Compiling the forward
+		# method instead returns a plain callable — the recursive walk finds
+		# no OptimizedModule anywhere and accelerate is happy.
+		# Has to happen after resize_token_embeddings — Dynamo would otherwise
+		# capture the pre-resize embed_tokens weight identity and recompile on
+		# the first forward when the weight tensor is swapped out.
+		if _compile_mode is not None:
+			print(
+				f"[compile] compiling lm_model.model.forward (mode={_compile_mode!r})",
+				file = sys.stderr )
+			lm_model.model.forward = torch.compile( lm_model.model.forward, mode = _compile_mode )
 
 		stt_init_id = params.pop( "stt_init_id", None )
 		ett_init_id = params.pop( "ett_init_id", None )
