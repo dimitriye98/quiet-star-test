@@ -322,7 +322,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			self.lm_model.lm_head.weight, h, targets.reshape( -1 ), bias
 		).reshape_as( targets )
 
-	def broadcast_forward( self, ts, kv_cache, layers_cached, layer_to_gen, mask, keep = 1, *, compute_logits = True ):
+	def broadcast_forward( self, ts, kv_cache, layers_cached, layer_to_gen, mask, keep = 1, *,
+			padding_mask = None, compute_logits = True ):
 		b, n, d, l = ts.shape
 
 		if keep is None:
@@ -333,7 +334,21 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		else:
 			cache_pos = None
 
-		a_mask = x.rearrange( "b n D L d l -> (b n) 1 (D L) (d l)", mask )
+		# Factored attention: skip the dense rank-4 mask, thread (d, l, padding) via kwargs.
+		factored = getattr( self.lm_model.config, "_attn_implementation", None ) == "thought_factored"
+		if factored:
+			a_mask = None
+			attn_extra = dict(
+				padding_mask = padding_mask,
+				thought_d_q = layer_to_gen - layers_cached,
+				thought_d_kv = layer_to_gen,
+				thought_l = l,
+				q_depth_offset = layers_cached,
+			)
+		else:
+			a_mask = x.rearrange( "b n D L d l -> (b n) 1 (D L) (d l)", mask )
+			attn_extra = {}
+
 		input_ids = x.rearrange( "b n d l -> (b n) (d l)", ts )
 		inputs_embeds = self._embed( input_ids )
 		position_ids = x.rearrange(
@@ -352,6 +367,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				return_dict = True,
 				cache_position = cache_pos,
 				logits_to_keep = l * keep,
+				**attn_extra,
 			)
 
 			log = x.rearrange( "(b n) (d l) v -> b n d l v", out.logits, b = b, n = n, d = keep, l = l )
@@ -370,6 +386,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				output_hidden_states = False,
 				return_dict = True,
 				cache_position = cache_pos,
+				**attn_extra,
 			)
 
 			hidden = x.rearrange( "(b n) (d l) e -> b n d l e", out.last_hidden_state, b = b, n = n, d = d, l = l )[ ...,
@@ -449,14 +466,25 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			dtype = ts.dtype )
 		ts = t.cat( (ts, start_toks), dim = -2 )
 
-		# rank-6 mask of shape (b, n, d, l, d, l)
-		thought_mask = self.construct_thought_mask(
-			b = ts.shape[ 0 ],
-			n = ts.shape[ 1 ],
-			d = 2 + self.look_ahead + self.thought_depth,  # input (1), start tok (1), depth, end tok (1), look ahead (-1 for teacher forcing shift)
-			l = ts.shape[ 3 ],
-			padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = self.n_thoughts )[ ..., :-self.look_ahead ],
-			dtype = self.dtype )
+		# Factored attention skips the dense rank-6 mask entirely; the per-layer
+		# attention impl reconstructs the implicit causal+prefix structure from
+		# (d, l, q_off, padding_mask) threaded via broadcast_forward kwargs.
+		factored = getattr( self.lm_model.config, "_attn_implementation", None ) == "thought_factored"
+		# (b*n, l - look_ahead) bool — True = valid token. Used by both paths
+		# (rank-6 mask construction below, and the factored path's K-mask).
+		factored_padding_mask = x.rearrange(
+			"b l -> (b n) l", padding_mask, n = self.n_thoughts )[ :, :-self.look_ahead ].bool()
+		if factored:
+			thought_mask = None
+		else:
+			# rank-6 mask of shape (b, n, d, l, d, l)
+			thought_mask = self.construct_thought_mask(
+				b = ts.shape[ 0 ],
+				n = ts.shape[ 1 ],
+				d = 2 + self.look_ahead + self.thought_depth,  # input (1), start tok (1), depth, end tok (1), look ahead (-1 for teacher forcing shift)
+				l = ts.shape[ 3 ],
+				padding_mask = x.rearrange( "b l -> b n l", padding_mask, n = self.n_thoughts )[ ..., :-self.look_ahead ],
+				dtype = self.dtype )
 
 		# Generate thoughts (depth 0 already cached from naive_forward)
 		# We accumulate hidden states (for FLCE later) and per-slice entropy (for logging).
@@ -467,7 +495,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		thought_hidden_states = None
 		thought_entropy_acc = None
 		for i in range( self.thought_depth ):
-			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
+			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ] if thought_mask is not None else None
 
 			_, new_hidden = self.broadcast_forward(
 				ts[ :, :, layers_cached: layer_to_gen, : ],
@@ -475,6 +503,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				layers_cached,
 				layer_to_gen,
 				slice_mask,
+				padding_mask = factored_padding_mask,
 				compute_logits = False )
 
 			if i == 0:
@@ -525,7 +554,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			for i in range( self.look_ahead ):
 				if i > 0:
 					layer_to_gen += 1
-				slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
+				slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ] if thought_mask is not None else None
 				_, hidden = self.broadcast_forward(
 					ts[ :, :, layers_cached: layer_to_gen, : ],
 					kv_cache,
@@ -533,6 +562,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 					layer_to_gen,
 					slice_mask,
 					keep = 1,
+					padding_mask = factored_padding_mask,
 					compute_logits = False )
 				if i == 0:
 					post_hidden_states = hidden
@@ -541,7 +571,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				layers_cached = layer_to_gen
 		else:
 			layer_to_gen += self.look_ahead - 1  # -1 because targets have one fewer layer for teacher forcing shift
-			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
+			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ] if thought_mask is not None else None
 			_, post_hidden_states = self.broadcast_forward(
 				ts[ :, :, layers_cached: layer_to_gen, : ],
 				kv_cache,
@@ -549,6 +579,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				layer_to_gen,
 				slice_mask,
 				keep = self.look_ahead,
+				padding_mask = factored_padding_mask,
 				compute_logits = False )
 			# We won't use this anymore, but update it as a matter of hygiene
 			layers_cached = layer_to_gen

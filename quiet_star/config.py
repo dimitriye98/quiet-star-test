@@ -11,6 +11,7 @@ DEFAULT_CONFIG = {
 		"torch_dtype": "bfloat16",
 		"device_map": "auto",
 		"tokenizer_padding_side": "left",
+		"factored_attention": False,
 	},
 
 	"thought_model": {

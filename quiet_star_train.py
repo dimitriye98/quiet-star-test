@@ -888,10 +888,17 @@ def train(config, resume_from = None):
 
 		# DeepSpeed manages device placement; device_map conflicts with it
 		dm = None if training_args.deepspeed else config["base_model"]["device_map"]
-		lm_model = AutoLigerKernelForCausalLM.from_pretrained(
-			config["base_model"]["name"],
+		from_pretrained_kwargs = dict(
 			torch_dtype = dtype,
 			device_map = dm,
+		)
+		if config["base_model"].get( "factored_attention", False ):
+			# Side-effect import: registers "thought_factored" in ALL_ATTENTION_FUNCTIONS.
+			import quiet_star.factored_attention  # noqa: F401
+			from_pretrained_kwargs["attn_implementation"] = "thought_factored"
+		lm_model = AutoLigerKernelForCausalLM.from_pretrained(
+			config["base_model"]["name"],
+			**from_pretrained_kwargs,
 		)
 
 		print( "Loaded model" )
