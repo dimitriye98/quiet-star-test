@@ -669,6 +669,31 @@ def train(config, resume_from = None):
 	if _compile_mode_full is not None:
 		_compile_mode = None
 
+	# Opt-in activation checkpointing on the per-call LM forwards (prior pass +
+	# every broadcast_forward in the depth loop / look-ahead pass). Now safe
+	# with StaticCache: cache writes are at fixed slots via cache_position, so
+	# re-execution during backward rewrites the same K/V to the same slots
+	# (idempotent), and the thought-loop mask restricts each call's reads to
+	# depths causal relative to that call (later forwards' writes don't pollute
+	# the recomputation). Cuts ~150-200 MB / call × 12 calls ≈ 2 GB of activation
+	# memory per micro-batch — the difference between fitting 7B and OOMing.
+	_grad_ckpt = os.environ.get( "QUIET_STAR_GRAD_CKPT" ) == "1"
+	if _grad_ckpt and ( _compile_mode is not None or _compile_mode_full is not None ):
+		# Force-disable compile under grad-ckpt: torch.utils.checkpoint runs
+		# the recomputation with Dynamo disabled (`_run_fn_with_dynamo_disabled`),
+		# so the inner compiled forward falls back to eager during backward.
+		# The eager fallback's intermediate metadata differs from the compiled
+		# forward's (different op decompositions, fused vs unfused tensors),
+		# tripping checkpoint's `use_reentrant=False` determinism check with a
+		# CheckpointError on every backward.
+		print(
+			"[grad-ckpt] disabling QUIET_STAR_COMPILE / QUIET_STAR_COMPILE_FULL — "
+			"checkpoint recomputation runs with Dynamo disabled, and the eager "
+			"fallback's tensor metadata won't match the compiled forward's.",
+			file = sys.stderr )
+		_compile_mode = None
+		_compile_mode_full = None
+
 	@contextlib.contextmanager
 	def cm_memory():
 		if not _memory_profile:
@@ -1049,6 +1074,14 @@ def train(config, resume_from = None):
 				f"[compile] training_forward will compile after first eager call (mode={_compile_mode_full!r})",
 				file = sys.stderr )
 			model._compile_mode_full = _compile_mode_full
+
+		# Plumb the activation-checkpoint flag through to the model — read by
+		# ThoughtModel._maybe_ckpt to wrap each LM forward with checkpoint().
+		if _grad_ckpt:
+			print(
+				"[grad-ckpt] activation checkpointing enabled on prior naive_forward and all broadcast_forward calls",
+				file = sys.stderr )
+			model._grad_ckpt = True
 
 		model.train()
 		return model

@@ -1,6 +1,7 @@
 from typing import override
 import einx as x
 import torch as t
+import torch.utils.checkpoint as ckpt_utils
 from transformers import GenerationMixin, PreTrainedModel, DynamicCache, StaticCache, PretrainedConfig, AutoConfig, AutoModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutput
@@ -379,8 +380,14 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 	def naive_forward( self, input_ids, padding_mask, kv_cache = None, cache_pos = None, keep = 1, *, compute_logits = True ):
 		assert cache_pos is None or input_ids.shape[ -1 ] == cache_pos.shape[ -1 ]
-		assert padding_mask.shape[ -1 ] == input_ids.shape[ -1 ] + (
-			kv_cache.get_seq_length() if kv_cache is not None else 0)
+		# Removed the padding_mask length sanity check that referenced
+		# kv_cache.get_seq_length(): under StaticCache get_seq_length() counts
+		# non-zero positions, which becomes nonzero after the first forward
+		# and trips the assert during gradient-checkpoint recomputation in
+		# backward (the cache state has changed since the original forward).
+		# The check was only meaningful under DynamicCache's append semantics;
+		# with explicit cache_position past-seen-tokens comes from cache_pos[0]
+		# and Mistral handles the mask sizing internally.
 
 		if self.training:
 			model_input = { "inputs_embeds": self._embed( input_ids ) }
@@ -419,6 +426,27 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			hidden = out.last_hidden_state[ ..., -keep:, : ]
 
 			return None, hidden
+
+	def _maybe_ckpt( self, fn, *args, **kwargs ):
+		"""Conditionally wrap fn in torch.utils.checkpoint.checkpoint, gated on
+		self._grad_ckpt (set externally via QUIET_STAR_GRAD_CKPT). Drops
+		intermediate activations from fn's forward graph and recomputes them
+		during backward — trades compute for memory.
+
+		Safe for our pattern because:
+		  - StaticCache writes are at fixed slots via cache_position, idempotent
+		    under re-execution. Re-running a checkpointed broadcast_forward
+		    rewrites the same K/V to the same slots.
+		  - The thought-loop attention mask restricts each call's reads to
+		    depths causal relative to that call. Later calls' writes to the
+		    same cache buffer don't pollute the recomputation (those positions
+		    are masked out at -inf).
+
+		use_reentrant=False is required — the reentrant variant interacts
+		badly with autograd hooks under DDP / DeepSpeed."""
+		if getattr( self, "_grad_ckpt", False ):
+			return ckpt_utils.checkpoint( fn, *args, use_reentrant = False, **kwargs )
+		return fn( *args, **kwargs )
 
 	def _ensure_static_caches( self, b, L, device ):
 		"""Lazy-allocate the two StaticCaches on first training_forward call.
@@ -502,7 +530,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 		# Prior LM forward — populates prior_cache at positions [0, L-1).
 		cache_pos_prior = t.arange( L - 1, device = device )
-		_, prior_hidden_states = self.naive_forward(
+		_, prior_hidden_states = self._maybe_ckpt(
+			self.naive_forward,
 			input_ids[ :, :-1 ], padding_mask[ :, :-1 ],
 			kv_cache = prior_cache, cache_pos = cache_pos_prior,
 			keep = input_ids.shape[ -1 ], compute_logits = False )
@@ -565,7 +594,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			# inside this loop (sampled tokens written to subsequent slots). Without
 			# the clone, ts's version bumps invalidate the saved views from earlier
 			# iterations.
-			_, new_hidden = self.broadcast_forward(
+			_, new_hidden = self._maybe_ckpt(
+				self.broadcast_forward,
 				ts[ :, :, layers_cached: layer_to_gen, : ].clone(),
 				broadcast_cache,
 				layers_cached,
@@ -615,7 +645,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 				if i > 0:
 					layer_to_gen += 1
 				slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
-				_, hidden = self.broadcast_forward(
+				_, hidden = self._maybe_ckpt(
+					self.broadcast_forward,
 					ts[ :, :, layers_cached: layer_to_gen, : ],
 					broadcast_cache,
 					layers_cached,
@@ -631,7 +662,8 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		else:
 			layer_to_gen += self.look_ahead - 1  # -1 because targets have one fewer layer for teacher forcing shift
 			slice_mask = thought_mask[ :, :, layers_cached: layer_to_gen, :, :, : ]
-			_, post_hidden_states = self.broadcast_forward(
+			_, post_hidden_states = self._maybe_ckpt(
+				self.broadcast_forward,
 				ts[ :, :, layers_cached: layer_to_gen, : ],
 				broadcast_cache,
 				layers_cached,
