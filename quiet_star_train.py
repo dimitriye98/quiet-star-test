@@ -694,6 +694,14 @@ def train(config, resume_from = None):
 		_compile_mode = None
 		_compile_mode_full = None
 
+	# Per-step GPU memory probe: prints PyTorch's view (memory_allocated /
+	# max / reserved) alongside the OS-level view (mem_get_info: actual used
+	# vs free). The gap between them is non-PyTorch memory — primarily
+	# DeepSpeed's own buffers (optimizer state, offload swap windows, custom
+	# kernels). When the snapshot says ~15 GB but actual GPU usage is 77 GB
+	# at OOM, that gap IS the missing diagnostic.
+	_mem_probe = os.environ.get( "QUIET_STAR_MEM_PROBE" ) == "1"
+
 	@contextlib.contextmanager
 	def cm_memory():
 		if not _memory_profile:
@@ -759,9 +767,13 @@ def train(config, resume_from = None):
 			# it unset (None) avoids confusing readers with a dead DynamicCache.
 			inputs.pop( "past_key_values", None )
 
+			if _mem_probe:
+				_print_mem( "compute_loss/pre" )
 			with cm_memory() if torch.cuda.is_available() else contextlib.nullcontext():
 				loss, o = super().compute_loss(
 					model, inputs, return_outputs = True, num_items_in_batch = num_items_in_batch )
+			if _mem_probe:
+				_print_mem( "compute_loss/post" )
 			# training_forward returns raw per-sample tensors so the forward
 			# stays compile-friendly; reduce to scalars here, on the trainer
 			# side, where .item() syncs and python conditionals are fine.
@@ -891,6 +903,48 @@ def train(config, resume_from = None):
 				chain.append( f"{opt.__class__.__module__}.{opt.__class__.__name__}" )
 				opt = getattr( opt, "optimizer", None )
 			print( f"[opt-check] optimizer chain: {' -> '.join( chain )}", file = sys.stderr )
+
+	def _print_mem( label ):
+		"""Module-level helper: print PyTorch and OS-level GPU memory views.
+		The gap (used_total - alloc) is non-PyTorch memory — almost entirely
+		DeepSpeed's own buffers (offload swap, ZeRO bucket buffers, custom
+		kernel temporaries). When the snapshot says 15 GB but actual usage
+		is 77 GB at OOM, that gap IS what we need to quantify."""
+		if not torch.cuda.is_available():
+			return
+		free, total = torch.cuda.mem_get_info()
+		used = total - free
+		alloc = torch.cuda.memory_allocated()
+		peak = torch.cuda.max_memory_allocated()
+		reserved = torch.cuda.memory_reserved()
+		non_pt = used - alloc
+		print(
+			f"[mem {label}] "
+			f"alloc={alloc / 1e9:.2f}G "
+			f"peak={peak / 1e9:.2f}G "
+			f"reserved={reserved / 1e9:.2f}G "
+			f"used_total={used / 1e9:.2f}G "
+			f"non_pt={non_pt / 1e9:.2f}G "
+			f"free={free / 1e9:.2f}G",
+			file = sys.stderr )
+
+	class MemoryProbeCallback( TrainerCallback ):
+		"""Per-event GPU memory probe gated on QUIET_STAR_MEM_PROBE=1. Fires
+		at every callback boundary that's reachable before an OOM in the
+		first forward — train_begin (baseline post-init), step_begin (before
+		each optimizer step), substep_end (after each micro-batch),
+		step_end (after each optimizer step). compute_loss also gets per-call
+		entry/exit prints for finer granularity within a single micro-batch
+		when the OOM is mid-forward."""
+		def on_train_begin( self, args, state, control, **kwargs ):
+			_print_mem( "train_begin" )
+		def on_step_begin( self, args, state, control, **kwargs ):
+			_print_mem( f"step_begin/{state.global_step}" )
+		def on_substep_end( self, args, state, control, **kwargs ):
+			_print_mem( f"substep_end/{state.global_step}" )
+		def on_step_end( self, args, state, control, **kwargs ):
+			_print_mem( f"step_end/{state.global_step}" )
+			torch.cuda.reset_peak_memory_stats()
 
 	class TorchProfilerCallback( TrainerCallback ):
 		"""Opt-in torch.profiler wrapper gated on QUIET_STAR_TORCH_PROFILE=1.
@@ -1168,6 +1222,8 @@ def train(config, resume_from = None):
 	cb_list = [ ConfigArtifactCallback( config ), graceful_cb, SyncEmbeddingsCallback(), OptimizerProbeCallback() ]
 	if _torch_profile:
 		cb_list.append( TorchProfilerCallback() )
+	if _mem_probe:
+		cb_list.append( MemoryProbeCallback() )
 	trainer = TrainerWithCache(
 		args = training_args,
 		train_dataset = train_dataset,
