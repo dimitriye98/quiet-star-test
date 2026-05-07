@@ -695,7 +695,7 @@ def train(config, resume_from = None):
 			was_training = self.model.training
 			self.model.eval()
 			try:
-				acc = eval_csqa(
+				metrics = eval_csqa(
 					model = self.model,
 					tokenizer = self.processing_class,
 					dataset = self._csqa_validation,
@@ -705,7 +705,7 @@ def train(config, resume_from = None):
 			finally:
 				if was_training:
 					self.model.train()
-			results = { metric_key_prefix + "commonsense_qa/acc": acc }
+			results = { f"{metric_key_prefix}commonsense_qa/{k}": v for k, v in metrics.items() }
 			self.log( results )
 			return results
 

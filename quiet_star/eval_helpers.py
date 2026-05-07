@@ -35,20 +35,28 @@ def _format_csqa_prompt(question, choices):
 def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature=0.0):
 	"""Custom CSQA eval matching the reference impl's letter-token format.
 
-	Left-pads per batch and computes the model's logit at the position right after
-	"A:", restricted to the [A,B,C,D,E] token IDs. Compatible with the user's
-	`inference_forward` which only returns the last position's logits, because with
-	left-padding the last position is each example's actual end of input.
+	Left-pads per batch and reads the model's logit at the position right after
+	"A:". Reports two metrics:
+	- ``acc``: argmax over [A,B,C,D,E] (exact-match accuracy).
+	- ``soft_acc``: average renormalized probability of the correct letter under
+	  softmax over [A,B,C,D,E,\\n] — this is the metric the reference impl's
+	  ``compute_metrics`` returns and what the paper's reported numbers reflect.
+
+	Compatible with our ``inference_forward`` returning only the last position's
+	logits, because with left-padding the last position is each example's actual
+	end of input.
 	"""
+	# A/B/C/D/E ids for Mistral. Newline is included in the soft-acc denominator
+	# to match the reference's `valid_letter_tokens = [330, 365, 334, 384, 413, 13]`.
 	letter_ids = [tokenizer.encode(c, add_special_tokens=False)[0] for c in ["A", "B", "C", "D", "E"]]
 	letter_ids_t = torch.tensor(letter_ids, device=device)
+	soft_ids_t = torch.tensor(letter_ids + [13], device=device)
 
-	# We construct prompts manually with left-padding regardless of the tokenizer's
-	# default padding_side, by temporarily flipping it and restoring on exit.
 	original_side = tokenizer.padding_side
 	tokenizer.padding_side = "left"
 	try:
 		correct = 0
+		soft_sum = 0.0
 		total = 0
 		n = len(dataset)
 		for start in range(0, n, batch_size):
@@ -57,12 +65,11 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 				_format_csqa_prompt(q, c)
 				for q, c in zip(batch["question"], batch["choices"])
 			]
-			labels = [ord(k) - ord("A") for k in batch["answerKey"]]
+			labels = torch.tensor([ord(k) - ord("A") for k in batch["answerKey"]], device=device)
 
 			encoded = tokenizer(prompts, return_tensors="pt", padding=True)
 			input_ids = encoded.input_ids.to(device)
 			attention_mask = encoded.attention_mask.to(device)
-			# Zero-indexed positions per example: pad → 0 (clamp), real → 0..real_len-1.
 			position_ids = (attention_mask.long().cumsum(dim=-1) - 1).clamp(min=0)
 
 			out = model(
@@ -71,15 +78,22 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 				position_ids=position_ids,
 				thought_temperature=thought_temperature,
 			)
-			# inference_forward returns shape (b, 1, vocab); take the last (only) position.
-			logits = out.logits[:, -1, :]
+			logits = out.logits[:, -1, :].float()
+
+			# Argmax over the 5 letters
 			letter_logits = logits.index_select(dim=-1, index=letter_ids_t)
-			preds = letter_logits.argmax(dim=-1).tolist()
-			for pred, label in zip(preds, labels):
-				if pred == label:
-					correct += 1
-				total += 1
+			preds = letter_logits.argmax(dim=-1)
+			correct += (preds == labels).sum().item()
+
+			# Soft accuracy: renormalized prob over [A,B,C,D,E,\n] of the correct letter
+			soft_logits = logits.index_select(dim=-1, index=soft_ids_t)
+			soft_probs = soft_logits.softmax(dim=-1)
+			soft_sum += soft_probs.gather(1, labels.unsqueeze(-1)).squeeze(-1).sum().item()
+
+			total += labels.shape[0]
 	finally:
 		tokenizer.padding_side = original_side
 
-	return correct / total if total > 0 else 0.0
+	if total == 0:
+		return {"acc": 0.0, "soft_acc": 0.0}
+	return {"acc": correct / total, "soft_acc": soft_sum / total}
