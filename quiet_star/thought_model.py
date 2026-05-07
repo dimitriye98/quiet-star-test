@@ -298,8 +298,10 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		return t.zeros_like( combined_mask, dtype = dtype, device = device ).masked_fill(
 			~combined_mask, t.finfo( dtype ).min )
 
-	@staticmethod
-	def sample_thoughts( logits, thought_temperature ):
+	def sample_thoughts( self, logits, thought_temperature ):
+		logits = logits.clone()
+		logits[ ..., self.start_thought_token_id ] = t.finfo( logits.dtype ).min
+		logits[ ..., self.end_thought_token_id ] = t.finfo( logits.dtype ).min
 		if thought_temperature != 0.0:
 			logits = t.nn.functional.gumbel_softmax( logits, tau = thought_temperature, hard = True, dim = -1 )
 
