@@ -386,7 +386,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 			return None, hidden
 
-	def naive_forward( self, input_ids, padding_mask, kv_cache = None, cache_pos = None, keep = 1, *, compute_logits = True ):
+	def naive_forward( self, input_ids, padding_mask, kv_cache = None, cache_pos = None, position_ids = None, keep = 1, *, compute_logits = True ):
 		assert cache_pos is None or input_ids.shape[ -1 ] == cache_pos.shape[ -1 ]
 		assert padding_mask.shape[ -1 ] == input_ids.shape[ -1 ] + (
 			kv_cache.get_seq_length() if kv_cache is not None else 0)
@@ -400,6 +400,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			out = self.lm_model(
 				**model_input,
 				attention_mask = padding_mask,
+				position_ids = position_ids,
 				past_key_values = kv_cache,
 				use_cache = kv_cache is not None,
 				output_attentions = False,
@@ -417,6 +418,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			out = self.lm_model.model(
 				**model_input,
 				attention_mask = padding_mask,
+				position_ids = position_ids,
 				past_key_values = kv_cache,
 				use_cache = kv_cache is not None,
 				output_attentions = False,
@@ -703,7 +705,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 	@t.inference_mode()
 	def inference_forward(
 			self, input_ids, padding_mask, thought_temperature, *, kv_cache = None, cache_pos = None,
-			thought_depth = None ):
+			position_ids = None, thought_depth = None ):
 		if thought_depth is None:
 			thought_depth = self.thought_depth
 		b, l = input_ids.shape
@@ -712,29 +714,36 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			l += kv_cache.get_seq_length()
 
 		if padding_mask is None:
-			padding_mask = t.full( (b, l), 1, device = input_ids.device, dtype = input_ids.dtype )
+			padding_mask = t.full( (b, l), 1, device = input_ids.device, dtype = t.long )
+
+		if position_ids is None:
+			# Derive zero-indexed positions per example from padding_mask. Correct for
+			# left-padded inputs: pad positions get 0 (clamp), real tokens get 0..real_len-1.
+			position_ids = (padding_mask.long().cumsum( dim = -1 ) - 1).clamp( min = 0 )
 
 		if cache_pos is None:
 			seen = kv_cache.get_seq_length() if kv_cache is not None else 0
 			cache_pos = t.arange( seen, l, device = input_ids.device )
 
 		prior_logits, prior_hidden = self.naive_forward(
-			input_ids, padding_mask, kv_cache = kv_cache, cache_pos = cache_pos
+			input_ids, padding_mask, position_ids = position_ids, kv_cache = kv_cache, cache_pos = cache_pos
 		)
 
 		# Catenate the start token
 		start_toks = t.full(
 			(b, 1), self.start_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
 		input_ids = t.cat( [ input_ids, start_toks ], dim = -1 ) if kv_cache is None else start_toks
-		unpad = t.full( (b, 1), True, device = input_ids.device, dtype = input_ids.dtype )
+		unpad = t.full( (b, 1), 1, device = padding_mask.device, dtype = padding_mask.dtype )
 		padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 )
-		cache_pos = t.cat( [ cache_pos, cache_pos[ ..., -1: ] + 1 ], dim = -1 ) if kv_cache is None else cache_pos[ ...,
-																										 -1: ] + 1
+		next_pos = position_ids[ ..., -1: ] + 1
+		position_ids = t.cat( [ position_ids, next_pos ], dim = -1 ) if kv_cache is None else next_pos
+		cache_pos = t.cat( [ cache_pos, cache_pos[ ..., -1: ] + 1 ], dim = -1 ) if kv_cache is None else cache_pos[ ..., -1: ] + 1
 
 		# Generate the thought
 		for _ in range( thought_depth ):
+			iter_position_ids = position_ids if kv_cache is None else position_ids[ ..., -1: ]
 			logits, _ = self.naive_forward(
-				input_ids, padding_mask, kv_cache = kv_cache,
+				input_ids, padding_mask, position_ids = iter_position_ids, kv_cache = kv_cache,
 				cache_pos = cache_pos
 			)
 
@@ -742,18 +751,21 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 
 			input_ids = t.cat( [ input_ids, toks ], dim = -1 ) if kv_cache is None else toks
 			padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 )
+			next_pos = position_ids[ ..., -1: ] + 1
+			position_ids = t.cat( [ position_ids, next_pos ], dim = -1 ) if kv_cache is None else next_pos
 			cache_pos = t.cat( [ cache_pos, cache_pos[ ..., -1: ] + 1 ], dim = -1 ) if kv_cache is None else cache_pos[ ..., -1: ] + 1
 
 		# Catenate the end token
 		end_toks = t.full( (b, 1), self.end_thought_token_id, device = input_ids.device, dtype = input_ids.dtype )
 		input_ids = t.cat( [ input_ids, end_toks ], dim = -1 )
 		padding_mask = t.cat( [ padding_mask, unpad ], dim = -1 )
+		position_ids = t.cat( [ position_ids, position_ids[ ..., -1: ] + 1 ], dim = -1 )
 
 		cache_offset = cache_pos[ ..., -1: ] + t.arange( 2, device = cache_pos.device )
 		cache_pos = t.cat( [ cache_pos, cache_offset[ -1: ] ], dim = -1 ) if kv_cache is None else cache_offset
 
 		post_logits, post_hidden = self.naive_forward(
-			input_ids, padding_mask, kv_cache = kv_cache, cache_pos = cache_pos
+			input_ids, padding_mask, position_ids = position_ids, kv_cache = kv_cache, cache_pos = cache_pos
 		)
 
 		alpha = self.mixer_head( prior_hidden, post_hidden )
@@ -789,7 +801,7 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 		else:
 			logits = self.inference_forward(
 				input_ids, attention_mask, thought_temperature, kv_cache = past_key_values, cache_pos = cache_position,
-				thought_depth = thought_depth )
+				position_ids = position_ids, thought_depth = thought_depth )
 			return CausalLMOutput( logits = logits )
 
 

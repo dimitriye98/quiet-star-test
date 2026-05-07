@@ -630,7 +630,7 @@ def train(config, resume_from = None):
 		_tqdm_loggable_ok = False
 	from liger_kernel.transformers import AutoLigerKernelForCausalLM
 	from datasets import load_dataset
-	from quiet_star.eval_helpers import preprocess_function
+	from quiet_star.eval_helpers import preprocess_function, eval_csqa
 
 	torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -674,6 +674,10 @@ def train(config, resume_from = None):
 			super().__init__( *args, **kwargs )
 			self.task_manager = TaskManager()
 			self.eval_lm_batch_size = eval_lm_batch_size
+			# Custom CSQA eval dataset: paper-format letter scoring with left-padding.
+			# We load once and reuse across eval calls.
+			self._csqa_validation = load_dataset(
+				"tau/commonsense_qa", "default", split = "validation" )
 
 		def evaluate(
 				self,
@@ -681,22 +685,19 @@ def train(config, resume_from = None):
 				ignore_keys = None,
 				metric_key_prefix: str = "eval" ):
 			metric_key_prefix = "eval_"
-			override = eval_dataset is not None
-			eval_dataset = eval_dataset if override else self.eval_dataset
-
-			hflm = HFLMThought(
-				self.model, backend = "causal", batch_size = self.eval_lm_batch_size,
-				max_batch_size = self.eval_lm_batch_size, tokenizer = self.processing_class )
-
-			results = simple_evaluate(
-				model = hflm,
-				tasks = eval_dataset,
-				task_manager = self.task_manager,
+			# Custom CSQA eval matching the reference impl format. Bypasses lm-eval-harness
+			# because HFLM's right-padding combined with our single-position inference_forward
+			# produced wrong logits for shorter examples in a batch (~random accuracy).
+			device = next( self.model.parameters() ).device
+			acc = eval_csqa(
+				model = self.model,
+				tokenizer = self.processing_class,
+				dataset = self._csqa_validation,
+				batch_size = self.eval_lm_batch_size,
+				device = device,
 			)
-			results = { metric_key_prefix + k: v for k, v in results[ "results" ].items() }
-
+			results = { metric_key_prefix + "commonsense_qa/acc": acc }
 			self.log( results )
-
 			return results
 
 		def compute_loss( self, model, inputs, return_outputs = False, num_items_in_batch = None ):
