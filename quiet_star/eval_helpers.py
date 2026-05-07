@@ -101,6 +101,23 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 					letter_p = p.gather(0, letter_ids_t).tolist()
 					print(f"[eval_csqa debug:{label}] P(A)={letter_p[0]:.4f} P(B)={letter_p[1]:.4f} P(C)={letter_p[2]:.4f} P(D)={letter_p[3]:.4f} P(E)={letter_p[4]:.4f}", flush=True)
 
+				# Sanity check: a simple prompt that any working Mistral-7B should
+				# continue with " John" / " Sarah" / etc. If this gives garbage too,
+				# the model load is broken (Liger, dtype, weights, or wrong model id).
+				sanity_prompt = "Hello, my name is"
+				sanity_ids = tokenizer(sanity_prompt, return_tensors="pt").input_ids.to(device)
+				sanity_out = model.lm_model(
+					input_ids=sanity_ids,
+					use_cache=False,
+					output_hidden_states=False,
+					return_dict=True,
+					logits_to_keep=1,
+				)
+				sanity_logits = sanity_out.logits[:, -1, :].float()
+				print(f"[eval_csqa debug:sanity] prompt: {sanity_prompt!r}", flush=True)
+				_print_top("sanity", sanity_logits[0])
+				del sanity_out, sanity_logits
+
 				_print_top("inference_forward", logits[0])
 
 				# Slice to just the first example for the bypass calls so we don't
