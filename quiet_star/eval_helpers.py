@@ -92,6 +92,20 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 				print(f"[eval_csqa debug] prompt:\n{prompts[0]!r}", flush=True)
 				print(f"[eval_csqa debug] correct answer: {batch['answerKey'][0]}", flush=True)
 
+				# Weight-level sanity: pretrained Mistral lm_head/embed_tokens have
+				# specific statistics (std ~0.04, non-uniform per-row norms because
+				# of training). Uninitialized weights are uniform random, std ~0.02.
+				lh = model.lm_model.lm_head.weight.detach().float()
+				et = model.lm_model.model.embed_tokens.weight.detach().float()
+				print(f"[eval_csqa debug:weights] lm_head shape={tuple(lh.shape)} dtype={lh.dtype} mean={lh.mean().item():.5f} std={lh.std().item():.5f}", flush=True)
+				print(f"[eval_csqa debug:weights] embed_tokens shape={tuple(et.shape)} dtype={et.dtype} mean={et.mean().item():.5f} std={et.std().item():.5f}", flush=True)
+				# Per-row norm distribution: pretrained models have a wide range,
+				# uninitialized weights have all rows ~equal norm.
+				lh_norms = lh.norm(dim=-1)
+				et_norms = et.norm(dim=-1)
+				print(f"[eval_csqa debug:weights] lm_head per-row norm: min={lh_norms.min().item():.4f} max={lh_norms.max().item():.4f} std={lh_norms.std().item():.4f}", flush=True)
+				print(f"[eval_csqa debug:weights] embed_tokens per-row norm: min={et_norms.min().item():.4f} max={et_norms.max().item():.4f} std={et_norms.std().item():.4f}", flush=True)
+
 				def _print_top(label, lg):
 					p = lg.softmax(dim=-1)
 					top_p, top_i = p.topk(10)
