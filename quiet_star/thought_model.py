@@ -11,6 +11,7 @@ class WeightedMixerHead( t.nn.Module ):
 	def __init__( self, config, lm_hidden_size ):
 		super().__init__()
 		self.config = config
+		self.use_sigmoid = config.mixer_config.use_sigmoid
 		hs, ms, nl = lm_hidden_size, config.mixer_config.hidden_size, config.mixer_config.hidden_layers
 		layers = [ t.nn.Linear( 2 * hs, ms ) ]
 		for _ in range( nl ):
@@ -21,7 +22,10 @@ class WeightedMixerHead( t.nn.Module ):
 
 	def forward( self, pre_thought_hidden_state, post_thought_hidden_state ):
 		catted_states = t.cat( (pre_thought_hidden_state, post_thought_hidden_state), dim = -1 )
-		return t.sigmoid(self.mlp( catted_states ))
+		out = self.mlp( catted_states )
+		if self.use_sigmoid:
+			out = t.sigmoid( out )
+		return out
 
 
 # class ConfidenceHead( t.nn.Module ):
@@ -49,6 +53,7 @@ class MixerConfig:
 			hidden_layers: int = 1,
 			hidden_size: int = None,
 			mixer_type: str = "weighted",
+			use_sigmoid: bool = True,
 			_inject_hidden_size: int = None,
 	):
 		if mixer_type != "weighted":
@@ -57,6 +62,7 @@ class MixerConfig:
 		self.activation = activation
 		self.hidden_layers = hidden_layers
 		self.mixer_type = mixer_type
+		self.use_sigmoid = use_sigmoid
 
 		self._hidden_size = hidden_size
 		self._injected_hidden_size = _inject_hidden_size
@@ -77,6 +83,7 @@ class MixerConfig:
 			"mixer_type": self.mixer_type,
 			"activation": self.activation,
 			"hidden_layers": self.hidden_layers,
+			"use_sigmoid": self.use_sigmoid,
 		}
 
 		if self._hidden_size is not None:
