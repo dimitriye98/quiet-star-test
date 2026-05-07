@@ -926,6 +926,14 @@ def train(config, resume_from = None):
 		special_tokens_to_add = [ "<thought>", "</thought>" ]
 		tokenizer.add_special_tokens( { "additional_special_tokens": special_tokens_to_add } )
 		lm_model.resize_token_embeddings( len( tokenizer ) )
+		# resize_token_embeddings replaces lm_head with a fresh nn.Linear whose
+		# `_is_hf_initialized` flag is not set. When ThoughtModel.post_init walks
+		# the module tree via apply(_initialize_weights), it would re-init this
+		# lm_head (clobbering the carefully-copied pretrained weights). Mark the
+		# resized lm_head and embed_tokens as already initialized so the walk
+		# leaves them alone.
+		lm_model.lm_head._is_hf_initialized = True
+		lm_model.get_input_embeddings()._is_hf_initialized = True
 		_lh = lm_model.lm_head.weight.detach().float()
 		_et = lm_model.model.embed_tokens.weight.detach().float()
 		print( f"[after_resize] lm_head: shape={tuple(_lh.shape)} std={_lh.std().item():.5f} "
@@ -948,6 +956,15 @@ def train(config, resume_from = None):
 
 		model_config = ThoughtModelConfig( **params )
 		model = AutoModel.from_config( model_config, lm_model = lm_model )
+		_lh = model.lm_model.lm_head.weight.detach().float()
+		_et = model.lm_model.model.embed_tokens.weight.detach().float()
+		print( f"[after_thought_model] lm_head: shape={tuple(_lh.shape)} std={_lh.std().item():.5f} "
+			   f"row_norm range=[{_lh.norm(dim=-1).min().item():.3f},{_lh.norm(dim=-1).max().item():.3f}] "
+			   f"row_norm std={_lh.norm(dim=-1).std().item():.4f}", flush = True )
+		print( f"[after_thought_model] embed_tokens: shape={tuple(_et.shape)} std={_et.std().item():.5f} "
+			   f"row_norm range=[{_et.norm(dim=-1).min().item():.3f},{_et.norm(dim=-1).max().item():.3f}] "
+			   f"row_norm std={_et.norm(dim=-1).std().item():.4f}", flush = True )
+		del _lh, _et
 
 		model.train()
 		return model
