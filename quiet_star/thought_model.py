@@ -1,3 +1,4 @@
+import os
 from typing import override
 import einx as x
 import torch as t
@@ -507,6 +508,18 @@ class ThoughtModel( PreTrainedModel, GenerationMixin ):
 			layer_to_gen += 1
 
 			ts = t.cat( (ts, new_toks), dim = -2 )
+
+		# Diagnostic: dump the sampled thought sequences for the first batch element
+		# at a few context positions, so we can see what the policy collapses onto.
+		if int( os.environ.get( "RANK", "0" ) ) == 0:
+			thoughts = ts[ 0, :, 2:2 + self.thought_depth, : ]  # (n, thought_depth, l)
+			n_pos = thoughts.shape[ -1 ]
+			probe_ls = [ 0, n_pos // 2, n_pos - 1 ]
+			for n_idx in range( thoughts.shape[ 0 ] ):
+				for pl in probe_ls:
+					print(
+						f"[thoughts b=0 n={n_idx} l={pl}]: {thoughts[ n_idx, :, pl ].tolist()}",
+						flush = True )
 
 		# Add </thought>
 		end_toks = t.full(
