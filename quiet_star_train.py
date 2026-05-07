@@ -899,13 +899,27 @@ def train(config, resume_from = None):
 
 		# DeepSpeed manages device placement; device_map conflicts with it
 		dm = None if training_args.deepspeed else config["base_model"]["device_map"]
-		lm_model = AutoLigerKernelForCausalLM.from_pretrained(
+		# Bypassing AutoLigerKernelForCausalLM to test whether Liger's patching is
+		# what's leaving lm_head uninitialized. The LigerFusedLinearCrossEntropyLoss
+		# in thought_model.py is called directly and is unaffected by this swap.
+		lm_model = AutoModelForCausalLM.from_pretrained(
 			config["base_model"]["name"],
 			torch_dtype = dtype,
 			device_map = dm,
 		)
 
 		print( "Loaded model" )
+		# Verify pretrained weights actually loaded. If lm_head std ~0.02 with tight
+		# per-row norm spread, the lm_head wasn't loaded from the checkpoint.
+		_lh = lm_model.lm_head.weight.detach().float()
+		_et = lm_model.model.embed_tokens.weight.detach().float()
+		print( f"[load_check] lm_head: shape={tuple(_lh.shape)} std={_lh.std().item():.5f} "
+			   f"row_norm range=[{_lh.norm(dim=-1).min().item():.3f},{_lh.norm(dim=-1).max().item():.3f}] "
+			   f"row_norm std={_lh.norm(dim=-1).std().item():.4f}", flush = True )
+		print( f"[load_check] embed_tokens: shape={tuple(_et.shape)} std={_et.std().item():.5f} "
+			   f"row_norm range=[{_et.norm(dim=-1).min().item():.3f},{_et.norm(dim=-1).max().item():.3f}] "
+			   f"row_norm std={_et.norm(dim=-1).std().item():.4f}", flush = True )
+		del _lh, _et
 
 		params[ "pad_token_id" ] = tokenizer.pad_token_id
 
