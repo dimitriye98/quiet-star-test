@@ -103,13 +103,19 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 
 				_print_top("inference_forward", logits[0])
 
+				# Slice to just the first example for the bypass calls so we don't
+				# triple-forward the full batch and OOM.
+				ex_input_ids = input_ids[:1]
+				ex_attention_mask = attention_mask[:1]
+				ex_position_ids = position_ids[:1]
+
 				# Bypass inference_forward and call the underlying Mistral directly
 				# with the same input/mask/position to see if the issue is in our wrapper
 				# or in our position_ids / attention_mask setup.
 				raw_out = model.lm_model(
-					input_ids=input_ids,
-					attention_mask=attention_mask,
-					position_ids=position_ids,
+					input_ids=ex_input_ids,
+					attention_mask=ex_attention_mask,
+					position_ids=ex_position_ids,
 					use_cache=False,
 					output_hidden_states=False,
 					return_dict=True,
@@ -117,11 +123,12 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 				)
 				raw_logits = raw_out.logits[:, -1, :].float()
 				_print_top("lm_model_direct", raw_logits[0])
+				del raw_out, raw_logits
 
 				# Also try without position_ids (let HF derive from cache_position).
 				raw_out2 = model.lm_model(
-					input_ids=input_ids,
-					attention_mask=attention_mask,
+					input_ids=ex_input_ids,
+					attention_mask=ex_attention_mask,
 					use_cache=False,
 					output_hidden_states=False,
 					return_dict=True,
@@ -129,6 +136,7 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 				)
 				raw_logits2 = raw_out2.logits[:, -1, :].float()
 				_print_top("lm_model_no_pos_ids", raw_logits2[0])
+				del raw_out2, raw_logits2
 
 			# Argmax over the 5 letters
 			letter_logits = logits.index_select(dim=-1, index=letter_ids_t)
