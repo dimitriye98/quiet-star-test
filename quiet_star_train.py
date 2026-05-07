@@ -901,6 +901,15 @@ def train(config, resume_from = None):
 		special_tokens_to_add = [ "<thought>", "</thought>" ]
 		tokenizer.add_special_tokens( { "additional_special_tokens": special_tokens_to_add } )
 		lm_model.resize_token_embeddings( len( tokenizer ) )
+		# resize_token_embeddings replaces lm_head and embed_tokens with fresh
+		# nn.Linear/nn.Embedding instances whose `_is_hf_initialized` flag is not
+		# set, even though it copies the pretrained weights into them. When
+		# ThoughtModel.post_init() then calls init_weights() → apply(_initialize_weights),
+		# the walk re-initializes anything without the flag, clobbering the
+		# pretrained lm_head with normal(0, initializer_range). Mark them as
+		# already initialized so the walk leaves them alone.
+		lm_model.lm_head._is_hf_initialized = True
+		lm_model.get_input_embeddings()._is_hf_initialized = True
 
 		stt_init_id = params.pop( "stt_init_id", None )
 		ett_init_id = params.pop( "ett_init_id", None )
