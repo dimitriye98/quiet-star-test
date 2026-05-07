@@ -689,13 +689,22 @@ def train(config, resume_from = None):
 			# because HFLM's right-padding combined with our single-position inference_forward
 			# produced wrong logits for shorter examples in a batch (~random accuracy).
 			device = next( self.model.parameters() ).device
-			acc = eval_csqa(
-				model = self.model,
-				tokenizer = self.processing_class,
-				dataset = self._csqa_validation,
-				batch_size = self.eval_lm_batch_size,
-				device = device,
-			)
+			# Standard Trainer.evaluate() goes through evaluation_loop which sets eval mode;
+			# we bypass that, so set/restore it ourselves. Without this, forward() dispatches
+			# to training_forward and asserts on the missing kv_cache.
+			was_training = self.model.training
+			self.model.eval()
+			try:
+				acc = eval_csqa(
+					model = self.model,
+					tokenizer = self.processing_class,
+					dataset = self._csqa_validation,
+					batch_size = self.eval_lm_batch_size,
+					device = device,
+				)
+			finally:
+				if was_training:
+					self.model.train()
 			results = { metric_key_prefix + "commonsense_qa/acc": acc }
 			self.log( results )
 			return results
