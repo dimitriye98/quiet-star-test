@@ -926,6 +926,15 @@ def train(config, resume_from = None):
 		special_tokens_to_add = [ "<thought>", "</thought>" ]
 		tokenizer.add_special_tokens( { "additional_special_tokens": special_tokens_to_add } )
 		lm_model.resize_token_embeddings( len( tokenizer ) )
+		_lh = lm_model.lm_head.weight.detach().float()
+		_et = lm_model.model.embed_tokens.weight.detach().float()
+		print( f"[after_resize] lm_head: shape={tuple(_lh.shape)} std={_lh.std().item():.5f} "
+			   f"row_norm range=[{_lh.norm(dim=-1).min().item():.3f},{_lh.norm(dim=-1).max().item():.3f}] "
+			   f"row_norm std={_lh.norm(dim=-1).std().item():.4f}", flush = True )
+		print( f"[after_resize] embed_tokens: shape={tuple(_et.shape)} std={_et.std().item():.5f} "
+			   f"row_norm range=[{_et.norm(dim=-1).min().item():.3f},{_et.norm(dim=-1).max().item():.3f}] "
+			   f"row_norm std={_et.norm(dim=-1).std().item():.4f}", flush = True )
+		del _lh, _et
 
 		stt_init_id = params.pop( "stt_init_id", None )
 		ett_init_id = params.pop( "ett_init_id", None )
