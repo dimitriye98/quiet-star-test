@@ -701,6 +701,7 @@ def train(config, resume_from = None):
 					dataset = self._csqa_validation,
 					batch_size = self.eval_lm_batch_size,
 					device = device,
+					debug_first_batch = True,
 				)
 			finally:
 				if was_training:

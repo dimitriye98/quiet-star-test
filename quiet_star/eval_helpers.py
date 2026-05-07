@@ -32,7 +32,7 @@ def _format_csqa_prompt(question, choices):
 
 
 @torch.inference_mode()
-def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature=0.0):
+def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature=0.0, debug_first_batch=False):
 	"""Custom CSQA eval matching the reference impl's letter-token format.
 
 	Left-pads per batch and reads the model's logit at the position right after
@@ -41,6 +41,12 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 	- ``soft_acc``: average renormalized probability of the correct letter under
 	  softmax over [A,B,C,D,E,\\n] — this is the metric the reference impl's
 	  ``compute_metrics`` returns and what the paper's reported numbers reflect.
+
+	If ``debug_first_batch`` is True, prints the top-10 predicted tokens (over
+	the full vocabulary) at the answer position for the first example of the
+	first batch. Useful for diagnosing whether the model is actually looking at
+	the right position — top tokens should at least include letters A-E or
+	plausible structural tokens (newline, space) for a sane Mistral baseline.
 
 	Compatible with our ``inference_forward`` returning only the last position's
 	logits, because with left-padding the last position is each example's actual
@@ -58,6 +64,7 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 		correct = 0
 		soft_sum = 0.0
 		total = 0
+		first_batch = True
 		n = len(dataset)
 		for start in range(0, n, batch_size):
 			batch = dataset[start:start + batch_size]
@@ -79,6 +86,18 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 				thought_temperature=thought_temperature,
 			)
 			logits = out.logits[:, -1, :].float()
+
+			if debug_first_batch and first_batch:
+				first_batch = False
+				probs = logits[0].softmax(dim=-1)
+				top_p, top_i = probs.topk(10)
+				print(f"[eval_csqa debug] prompt:\n{prompts[0]!r}", flush=True)
+				print(f"[eval_csqa debug] correct answer: {batch['answerKey'][0]}", flush=True)
+				print("[eval_csqa debug] top-10 next-token preds:", flush=True)
+				for p, i in zip(top_p.tolist(), top_i.tolist()):
+					print(f"  {i:6d} {tokenizer.decode([i])!r:>16s}  {p:.4f}", flush=True)
+				letter_p = probs.gather(0, letter_ids_t).tolist()
+				print(f"[eval_csqa debug] P(A)={letter_p[0]:.4f} P(B)={letter_p[1]:.4f} P(C)={letter_p[2]:.4f} P(D)={letter_p[3]:.4f} P(E)={letter_p[4]:.4f}", flush=True)
 
 			# Argmax over the 5 letters
 			letter_logits = logits.index_select(dim=-1, index=letter_ids_t)
