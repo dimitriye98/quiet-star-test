@@ -89,15 +89,46 @@ def eval_csqa(model, tokenizer, dataset, batch_size, device, thought_temperature
 
 			if debug_first_batch and first_batch:
 				first_batch = False
-				probs = logits[0].softmax(dim=-1)
-				top_p, top_i = probs.topk(10)
 				print(f"[eval_csqa debug] prompt:\n{prompts[0]!r}", flush=True)
 				print(f"[eval_csqa debug] correct answer: {batch['answerKey'][0]}", flush=True)
-				print("[eval_csqa debug] top-10 next-token preds:", flush=True)
-				for p, i in zip(top_p.tolist(), top_i.tolist()):
-					print(f"  {i:6d} {tokenizer.decode([i])!r:>16s}  {p:.4f}", flush=True)
-				letter_p = probs.gather(0, letter_ids_t).tolist()
-				print(f"[eval_csqa debug] P(A)={letter_p[0]:.4f} P(B)={letter_p[1]:.4f} P(C)={letter_p[2]:.4f} P(D)={letter_p[3]:.4f} P(E)={letter_p[4]:.4f}", flush=True)
+
+				def _print_top(label, lg):
+					p = lg.softmax(dim=-1)
+					top_p, top_i = p.topk(10)
+					print(f"[eval_csqa debug:{label}] top-10 next-token preds:", flush=True)
+					for pp, ii in zip(top_p.tolist(), top_i.tolist()):
+						print(f"  {ii:6d} {tokenizer.decode([ii])!r:>16s}  {pp:.4f}", flush=True)
+					letter_p = p.gather(0, letter_ids_t).tolist()
+					print(f"[eval_csqa debug:{label}] P(A)={letter_p[0]:.4f} P(B)={letter_p[1]:.4f} P(C)={letter_p[2]:.4f} P(D)={letter_p[3]:.4f} P(E)={letter_p[4]:.4f}", flush=True)
+
+				_print_top("inference_forward", logits[0])
+
+				# Bypass inference_forward and call the underlying Mistral directly
+				# with the same input/mask/position to see if the issue is in our wrapper
+				# or in our position_ids / attention_mask setup.
+				raw_out = model.lm_model(
+					input_ids=input_ids,
+					attention_mask=attention_mask,
+					position_ids=position_ids,
+					use_cache=False,
+					output_hidden_states=False,
+					return_dict=True,
+					logits_to_keep=1,
+				)
+				raw_logits = raw_out.logits[:, -1, :].float()
+				_print_top("lm_model_direct", raw_logits[0])
+
+				# Also try without position_ids (let HF derive from cache_position).
+				raw_out2 = model.lm_model(
+					input_ids=input_ids,
+					attention_mask=attention_mask,
+					use_cache=False,
+					output_hidden_states=False,
+					return_dict=True,
+					logits_to_keep=1,
+				)
+				raw_logits2 = raw_out2.logits[:, -1, :].float()
+				_print_top("lm_model_no_pos_ids", raw_logits2[0])
 
 			# Argmax over the 5 letters
 			letter_logits = logits.index_select(dim=-1, index=letter_ids_t)
